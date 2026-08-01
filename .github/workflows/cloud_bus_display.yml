@@ -1,0 +1,1269 @@
+name: Build and publish Bus Display cloud OTA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/cloud_bus_display.yml"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: bus-display-pages
+  cancel-in-progress: true
+
+env:
+  BOARD_REPOSITORY: https://github.com/mr-sven/esp32-8048S050C.git
+  PAGES_BASE_URL: https://colassn.github.io/Testesp32
+  IDF_IMAGE: espressif/idf:v5.5.2
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Clone proven display project
+        run: |
+          git clone --depth 1 "$BOARD_REPOSITORY" project
+
+      - name: Add home Wi-Fi, setup portal, bus UI and cloud OTA
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+          SHORT_SHA: ${{ github.sha }}
+        run: |
+          cat > project/main/main.c <<'MAIN_C'
+          #include <stdbool.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+
+          #include "freertos/FreeRTOS.h"
+          #include "freertos/event_groups.h"
+          #include "freertos/task.h"
+
+          #include "cJSON.h"
+          #include "driver/i2c_master.h"
+          #include "esp_crt_bundle.h"
+          #include "esp_event.h"
+          #include "esp_http_client.h"
+          #include "esp_http_server.h"
+          #include "esp_https_ota.h"
+          #include "esp_log.h"
+          #include "esp_netif.h"
+          #include "esp_ota_ops.h"
+          #include "esp_system.h"
+          #include "esp_wifi.h"
+          #include "mdns.h"
+          #include "nvs.h"
+          #include "nvs_flash.h"
+
+          #include "lvgl.h"
+          #include "sunton_esp32_8048s050c.h"
+
+          #ifndef FIRMWARE_BUILD
+          #define FIRMWARE_BUILD 0
+          #endif
+
+          #ifndef FIRMWARE_VERSION
+          #define FIRMWARE_VERSION "0.0.0"
+          #endif
+
+          #define SETUP_AP_SSID "BusDisplay-Setup"
+          #define SETUP_AP_PASS "esp32ota88"
+          #define DEVICE_HOSTNAME "busdisplay"
+
+          #define VERSION_URL \
+              "https://colassn.github.io/Testesp32/version.json"
+          #define LOCAL_OTA_BUFFER 4096
+          #define VERSION_RESPONSE_MAX 2048
+          #define CLOUD_CHECK_INTERVAL_MS (5 * 60 * 1000)
+
+          #define WIFI_CONNECTED_BIT BIT0
+
+          static const char *TAG = "bus_display";
+          static EventGroupHandle_t wifi_events;
+          static httpd_handle_t web_server;
+          static TaskHandle_t cloud_task_handle;
+
+          static lv_obj_t *eta_labels[3];
+          static lv_obj_t *wifi_status_label;
+          static lv_obj_t *cloud_status_label;
+          static lv_obj_t *updated_label;
+          static int eta_seconds[3] = {180, 660, 1440};
+          static uint32_t refresh_count;
+
+          static char saved_ssid[33];
+          static char saved_password[65];
+
+          typedef struct {
+              int build;
+              char version[32];
+              char firmware_url[256];
+          } cloud_release_t;
+
+          static const char MANAGEMENT_PAGE[] =
+              "<!doctype html><html lang='en'><head>"
+              "<meta charset='utf-8'>"
+              "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+              "<title>Bus Display</title>"
+              "<style>"
+              ":root{color-scheme:light;--ink:#17222b;--muted:#65717b;"
+              "--bg:#eef1f4;--card:#fff;--accent:#c9152b;--green:#167a62}"
+              "*{box-sizing:border-box}body{margin:0;background:var(--bg);"
+              "font-family:system-ui,-apple-system,sans-serif;color:var(--ink)}"
+              "main{max-width:620px;margin:0 auto;padding:22px}"
+              "header{padding:10px 2px 18px}h1{font-size:28px;margin:0 0 5px}"
+              "p{color:var(--muted);line-height:1.5}"
+              ".card{background:var(--card);border-radius:16px;padding:20px;"
+              "margin:0 0 16px;box-shadow:0 7px 24px #17222b12}"
+              "label{display:block;font-weight:650;margin:13px 0 6px}"
+              "input{width:100%;font:inherit;padding:12px;border:1px solid #ccd3d8;"
+              "border-radius:10px;background:white}"
+              "button{width:100%;font:inherit;font-weight:700;padding:13px;"
+              "border:0;border-radius:10px;background:var(--green);color:white;"
+              "margin-top:14px}.secondary{background:var(--ink)}"
+              ".status{padding:12px;border-radius:10px;background:#edf7f4;"
+              "white-space:pre-wrap}.small{font-size:13px}"
+              "</style></head><body><main>"
+              "<header><h1>Bus Display</h1>"
+              "<p>Wi-Fi setup, local recovery update and device status.</p></header>"
+              "<section class='card'><h2>Device status</h2>"
+              "<div id='status' class='status'>Loading...</div>"
+              "<button class='secondary' onclick='checkNow()'>Check cloud update now</button>"
+              "</section>"
+              "<section class='card'><h2>Home Wi-Fi</h2>"
+              "<form method='post' action='/wifi'>"
+              "<label>Wi-Fi name (SSID)</label>"
+              "<input name='ssid' maxlength='32' required>"
+              "<label>Password</label>"
+              "<input name='password' type='password' maxlength='64'>"
+              "<button type='submit'>Save and restart</button></form>"
+              "<p class='small'>The setup hotspot remains available as a recovery path.</p>"
+              "</section>"
+              "<section class='card'><h2>Local OTA recovery</h2>"
+              "<p class='small'>Upload an OTA APP .bin only. Never upload a FULL/merged file here.</p>"
+              "<input id='fw' type='file' accept='.bin'>"
+              "<button onclick='uploadFirmware()'>Upload and restart</button>"
+              "<div id='uploadStatus' class='small'></div></section>"
+              "</main><script>"
+              "async function refresh(){try{const r=await fetch('/api/status');"
+              "const j=await r.json();document.getElementById('status').textContent="
+              "`Firmware: ${j.version} (build ${j.build})\\n`+"
+              "`Home Wi-Fi: ${j.connected?'connected':'not connected'}\\n`+"
+              "`SSID: ${j.ssid||'-'}\\nIP: ${j.ip||'-'}\\n`+"
+              "`Cloud manifest: ${j.cloud}`;}catch(e){"
+              "document.getElementById('status').textContent='Status unavailable';}}"
+              "async function checkNow(){await fetch('/check',{method:'POST'});"
+              "document.getElementById('status').textContent='Cloud check requested...';"
+              "setTimeout(refresh,2500)}"
+              "async function uploadFirmware(){const f=document.getElementById('fw').files[0];"
+              "const s=document.getElementById('uploadStatus');if(!f){s.textContent='Choose a .bin first';return;}"
+              "if(!confirm('Upload '+f.name+'?'))return;s.textContent='Uploading...';"
+              "try{const r=await fetch('/update',{method:'POST',"
+              "headers:{'Content-Type':'application/octet-stream'},body:f});"
+              "s.textContent=await r.text()}catch(e){s.textContent='The device may be restarting.'}}"
+              "refresh();setInterval(refresh,5000);"
+              "</script></body></html>";
+
+          static void ui_set_text(lv_obj_t *label, const char *text)
+          {
+              if (label == NULL) {
+                  return;
+              }
+              lv_lock();
+              lv_label_set_text(label, text);
+              lv_unlock();
+          }
+
+          static void set_card_style(lv_obj_t *obj, uint32_t color)
+          {
+              lv_obj_set_style_bg_color(obj, lv_color_hex(color), 0);
+              lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
+              lv_obj_set_style_radius(obj, 14, 0);
+              lv_obj_set_style_border_width(obj, 0, 0);
+              lv_obj_set_style_pad_all(obj, 0, 0);
+              lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+          }
+
+          static lv_obj_t *make_label(
+              lv_obj_t *parent,
+              const char *text,
+              int x,
+              int y,
+              const lv_font_t *font,
+              uint32_t color)
+          {
+              lv_obj_t *label = lv_label_create(parent);
+              lv_label_set_text(label, text);
+              lv_obj_set_pos(label, x, y);
+              lv_obj_set_style_text_font(label, font, 0);
+              lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
+              return label;
+          }
+
+          static void format_eta(char *buffer, size_t buffer_size, int seconds)
+          {
+              if (seconds <= 30) {
+                  snprintf(buffer, buffer_size, "DUE");
+              } else {
+                  snprintf(buffer, buffer_size, "%d min", (seconds + 59) / 60);
+              }
+          }
+
+          static void update_eta_labels(void)
+          {
+              char text[32];
+
+              for (int i = 0; i < 3; ++i) {
+                  format_eta(text, sizeof(text), eta_seconds[i]);
+                  lv_label_set_text(eta_labels[i], text);
+              }
+
+              snprintf(text, sizeof(text), "Updated %lus ago",
+                       (unsigned long)refresh_count);
+              lv_label_set_text(updated_label, text);
+          }
+
+          static void eta_timer_cb(lv_timer_t *timer)
+          {
+              (void)timer;
+
+              for (int i = 0; i < 3; ++i) {
+                  eta_seconds[i]--;
+              }
+
+              if (eta_seconds[0] < -30) {
+                  eta_seconds[0] = eta_seconds[1];
+                  eta_seconds[1] = eta_seconds[2];
+                  eta_seconds[2] = eta_seconds[1] + 780;
+              }
+
+              refresh_count++;
+              update_eta_labels();
+          }
+
+          static void refresh_clicked(lv_event_t *event)
+          {
+              (void)event;
+              eta_seconds[0] = 180;
+              eta_seconds[1] = 660;
+              eta_seconds[2] = 1440;
+              refresh_count = 0;
+              update_eta_labels();
+
+              if (cloud_task_handle != NULL) {
+                  xTaskNotifyGive(cloud_task_handle);
+              }
+          }
+
+          static void make_eta_row(
+              lv_obj_t *screen,
+              int y,
+              const char *sequence,
+              const char *note,
+              uint32_t accent,
+              int index)
+          {
+              lv_obj_t *card = lv_obj_create(screen);
+              lv_obj_set_pos(card, 20, y);
+              lv_obj_set_size(card, 760, 72);
+              set_card_style(card, 0xffffff);
+
+              lv_obj_t *bar = lv_obj_create(card);
+              lv_obj_set_pos(bar, 0, 0);
+              lv_obj_set_size(bar, 9, 72);
+              set_card_style(bar, accent);
+              lv_obj_set_style_radius(bar, 0, 0);
+
+              make_label(card, sequence, 28, 11,
+                         &lv_font_montserrat_20, 0x17222b);
+              make_label(card, note, 28, 40,
+                         &lv_font_montserrat_14, 0x6b7680);
+
+              eta_labels[index] = make_label(
+                  card, "--", 610, 16,
+                  &lv_font_montserrat_32, accent);
+              lv_obj_set_width(eta_labels[index], 125);
+              lv_obj_set_style_text_align(
+                  eta_labels[index], LV_TEXT_ALIGN_RIGHT, 0);
+          }
+
+          static void create_bus_ui(void)
+          {
+              lv_obj_t *screen = lv_screen_active();
+              lv_obj_remove_style_all(screen);
+              lv_obj_set_style_bg_color(screen, lv_color_hex(0xeef1f4), 0);
+              lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+              lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+
+              lv_obj_t *header = lv_obj_create(screen);
+              lv_obj_set_pos(header, 0, 0);
+              lv_obj_set_size(header, 800, 76);
+              set_card_style(header, 0xc9152b);
+              lv_obj_set_style_radius(header, 0, 0);
+
+              lv_obj_t *route = lv_obj_create(header);
+              lv_obj_set_pos(route, 20, 12);
+              lv_obj_set_size(route, 118, 52);
+              set_card_style(route, 0xffd447);
+
+              lv_obj_t *route_label = make_label(
+                  route, "962B", 0, 7,
+                  &lv_font_montserrat_36, 0x151515);
+              lv_obj_set_width(route_label, 118);
+              lv_obj_set_style_text_align(
+                  route_label, LV_TEXT_ALIGN_CENTER, 0);
+
+              make_label(header, "BUS ARRIVALS", 158, 10,
+                         &lv_font_montserrat_20, 0xffffff);
+              make_label(header, "Towards Causeway Bay", 158, 39,
+                         &lv_font_montserrat_14, 0xffe7ea);
+
+              lv_obj_t *refresh_button = lv_button_create(header);
+              lv_obj_set_pos(refresh_button, 666, 14);
+              lv_obj_set_size(refresh_button, 114, 48);
+              lv_obj_set_style_bg_color(
+                  refresh_button, lv_color_hex(0x9f1022), 0);
+              lv_obj_set_style_radius(refresh_button, 12, 0);
+              lv_obj_add_event_cb(
+                  refresh_button, refresh_clicked, LV_EVENT_CLICKED, NULL);
+
+              lv_obj_t *refresh_text = lv_label_create(refresh_button);
+              lv_label_set_text(refresh_text, "REFRESH");
+              lv_obj_set_style_text_font(
+                  refresh_text, &lv_font_montserrat_14, 0);
+              lv_obj_center(refresh_text);
+
+              lv_obj_t *stop_card = lv_obj_create(screen);
+              lv_obj_set_pos(stop_card, 20, 90);
+              lv_obj_set_size(stop_card, 760, 78);
+              set_card_style(stop_card, 0x17222b);
+
+              make_label(stop_card, "STOP", 24, 12,
+                         &lv_font_montserrat_14, 0x94a1aa);
+              make_label(stop_card, "Tuen Mun Town Centre", 88, 8,
+                         &lv_font_montserrat_28, 0xffffff);
+              make_label(stop_card,
+                         "Platform A  |  Demonstration timetable",
+                         88, 46, &lv_font_montserrat_14, 0xcbd2d8);
+
+              make_eta_row(screen, 182, "1st bus",
+                           "Low-floor service", 0x15916f, 0);
+              make_eta_row(screen, 260, "2nd bus",
+                           "Scheduled service", 0xd88400, 1);
+              make_eta_row(screen, 338, "3rd bus",
+                           "Scheduled service", 0x5163d8, 2);
+
+              lv_obj_t *footer = lv_obj_create(screen);
+              lv_obj_set_pos(footer, 0, 428);
+              lv_obj_set_size(footer, 800, 52);
+              set_card_style(footer, 0x17222b);
+              lv_obj_set_style_radius(footer, 0, 0);
+
+              updated_label = make_label(
+                  footer, "Updated 0s ago", 20, 8,
+                  &lv_font_montserrat_14, 0xffffff);
+
+              wifi_status_label = make_label(
+                  footer, "Wi-Fi: setup hotspot ready", 20, 28,
+                  &lv_font_montserrat_14, 0xbfd0d7);
+
+              cloud_status_label = make_label(
+                  footer, "Cloud: waiting for home Wi-Fi", 390, 18,
+                  &lv_font_montserrat_14, 0xbfd0d7);
+              lv_obj_set_width(cloud_status_label, 390);
+              lv_obj_set_style_text_align(
+                  cloud_status_label, LV_TEXT_ALIGN_RIGHT, 0);
+
+              update_eta_labels();
+              lv_timer_create(eta_timer_cb, 1000, NULL);
+          }
+
+          static esp_err_t initialise_nvs(void)
+          {
+              esp_err_t error = nvs_flash_init();
+              if (error == ESP_ERR_NVS_NO_FREE_PAGES ||
+                  error == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+                  ESP_ERROR_CHECK(nvs_flash_erase());
+                  error = nvs_flash_init();
+              }
+              return error;
+          }
+
+          static void load_wifi_credentials(void)
+          {
+              nvs_handle_t handle;
+              size_t ssid_length = sizeof(saved_ssid);
+              size_t password_length = sizeof(saved_password);
+
+              saved_ssid[0] = '\0';
+              saved_password[0] = '\0';
+
+              if (nvs_open("wifi_cfg", NVS_READONLY, &handle) != ESP_OK) {
+                  return;
+              }
+
+              if (nvs_get_str(handle, "ssid", saved_ssid, &ssid_length) != ESP_OK) {
+                  saved_ssid[0] = '\0';
+              }
+
+              if (nvs_get_str(
+                      handle, "password", saved_password, &password_length) != ESP_OK) {
+                  saved_password[0] = '\0';
+              }
+
+              nvs_close(handle);
+          }
+
+          static esp_err_t save_wifi_credentials(
+              const char *ssid,
+              const char *password)
+          {
+              nvs_handle_t handle;
+              esp_err_t error = nvs_open("wifi_cfg", NVS_READWRITE, &handle);
+              if (error != ESP_OK) {
+                  return error;
+              }
+
+              error = nvs_set_str(handle, "ssid", ssid);
+              if (error == ESP_OK) {
+                  error = nvs_set_str(handle, "password", password);
+              }
+              if (error == ESP_OK) {
+                  error = nvs_commit(handle);
+              }
+
+              nvs_close(handle);
+              return error;
+          }
+
+          static void start_mdns_once(void)
+          {
+              static bool started = false;
+              if (started) {
+                  return;
+              }
+
+              if (mdns_init() == ESP_OK) {
+                  mdns_hostname_set(DEVICE_HOSTNAME);
+                  mdns_instance_name_set("Bus Arrival Display");
+                  mdns_service_add(
+                      "Bus Display", "_http", "_tcp", 80, NULL, 0);
+                  started = true;
+              }
+          }
+
+          static void wifi_event_handler(
+              void *arg,
+              esp_event_base_t event_base,
+              int32_t event_id,
+              void *event_data)
+          {
+              (void)arg;
+
+              if (event_base == WIFI_EVENT &&
+                  event_id == WIFI_EVENT_STA_START &&
+                  saved_ssid[0] != '\0') {
+                  esp_wifi_connect();
+                  return;
+              }
+
+              if (event_base == WIFI_EVENT &&
+                  event_id == WIFI_EVENT_STA_DISCONNECTED) {
+                  xEventGroupClearBits(wifi_events, WIFI_CONNECTED_BIT);
+                  if (saved_ssid[0] != '\0') {
+                      ui_set_text(wifi_status_label, "Wi-Fi: reconnecting...");
+                      esp_wifi_connect();
+                  }
+                  return;
+              }
+
+              if (event_base == IP_EVENT &&
+                  event_id == IP_EVENT_STA_GOT_IP) {
+                  ip_event_got_ip_t *event = event_data;
+                  char text[96];
+                  snprintf(text, sizeof(text),
+                           "Wi-Fi: %s  " IPSTR,
+                           saved_ssid, IP2STR(&event->ip_info.ip));
+                  ui_set_text(wifi_status_label, text);
+                  xEventGroupSetBits(wifi_events, WIFI_CONNECTED_BIT);
+                  start_mdns_once();
+
+                  if (cloud_task_handle != NULL) {
+                      xTaskNotifyGive(cloud_task_handle);
+                  }
+              }
+          }
+
+          static void start_wifi(void)
+          {
+              wifi_events = xEventGroupCreate();
+              load_wifi_credentials();
+
+              ESP_ERROR_CHECK(esp_netif_init());
+              ESP_ERROR_CHECK(esp_event_loop_create_default());
+              esp_netif_create_default_wifi_ap();
+              esp_netif_create_default_wifi_sta();
+
+              wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
+              ESP_ERROR_CHECK(esp_wifi_init(&init_config));
+
+              ESP_ERROR_CHECK(esp_event_handler_register(
+                  WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL));
+              ESP_ERROR_CHECK(esp_event_handler_register(
+                  IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL));
+
+              wifi_config_t ap_config = {0};
+              strlcpy((char *)ap_config.ap.ssid, SETUP_AP_SSID,
+                      sizeof(ap_config.ap.ssid));
+              strlcpy((char *)ap_config.ap.password, SETUP_AP_PASS,
+                      sizeof(ap_config.ap.password));
+              ap_config.ap.ssid_len = strlen(SETUP_AP_SSID);
+              ap_config.ap.channel = 1;
+              ap_config.ap.max_connection = 4;
+              ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+              ap_config.ap.pmf_cfg.required = false;
+
+              ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+              ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+
+              if (saved_ssid[0] != '\0') {
+                  wifi_config_t sta_config = {0};
+                  strlcpy((char *)sta_config.sta.ssid, saved_ssid,
+                          sizeof(sta_config.sta.ssid));
+                  strlcpy((char *)sta_config.sta.password, saved_password,
+                          sizeof(sta_config.sta.password));
+                  sta_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+                  sta_config.sta.pmf_cfg.capable = true;
+                  sta_config.sta.pmf_cfg.required = false;
+                  ESP_ERROR_CHECK(
+                      esp_wifi_set_config(WIFI_IF_STA, &sta_config));
+              }
+
+              ESP_ERROR_CHECK(esp_wifi_start());
+          }
+
+          static bool url_decode(
+              char *destination,
+              size_t destination_size,
+              const char *source)
+          {
+              if (destination_size == 0) {
+                  return false;
+              }
+
+              size_t written = 0;
+              while (*source != '\0' && written + 1 < destination_size) {
+                  if (*source == '%' &&
+                      source[1] != '\0' &&
+                      source[2] != '\0') {
+                      char hex[3] = {source[1], source[2], '\0'};
+                      destination[written++] = (char)strtol(hex, NULL, 16);
+                      source += 3;
+                  } else if (*source == '+') {
+                      destination[written++] = ' ';
+                      source++;
+                  } else {
+                      destination[written++] = *source++;
+                  }
+              }
+
+              destination[written] = '\0';
+              return *source == '\0';
+          }
+
+          static esp_err_t index_get_handler(httpd_req_t *request)
+          {
+              httpd_resp_set_type(request, "text/html");
+              httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+              return httpd_resp_send(
+                  request, MANAGEMENT_PAGE, HTTPD_RESP_USE_STRLEN);
+          }
+
+          static esp_err_t status_get_handler(httpd_req_t *request)
+          {
+              char ip_text[24] = "";
+              bool connected =
+                  (xEventGroupGetBits(wifi_events) & WIFI_CONNECTED_BIT) != 0;
+
+              if (connected) {
+                  esp_netif_t *netif =
+                      esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+                  esp_netif_ip_info_t info;
+                  if (netif != NULL &&
+                      esp_netif_get_ip_info(netif, &info) == ESP_OK) {
+                      snprintf(ip_text, sizeof(ip_text), IPSTR,
+                               IP2STR(&info.ip));
+                  }
+              }
+
+              char response[512];
+              snprintf(
+                  response, sizeof(response),
+                  "{\"version\":\"%s\",\"build\":%d,"
+                  "\"connected\":%s,\"ssid\":\"%s\",\"ip\":\"%s\","
+                  "\"cloud\":\"%s\"}",
+                  FIRMWARE_VERSION,
+                  FIRMWARE_BUILD,
+                  connected ? "true" : "false",
+                  saved_ssid,
+                  ip_text,
+                  VERSION_URL);
+
+              httpd_resp_set_type(request, "application/json");
+              httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+              return httpd_resp_sendstr(request, response);
+          }
+
+          static esp_err_t wifi_post_handler(httpd_req_t *request)
+          {
+              if (request->content_len <= 0 ||
+                  request->content_len > 512) {
+                  httpd_resp_send_err(
+                      request, HTTPD_400_BAD_REQUEST, "Invalid form data");
+                  return ESP_FAIL;
+              }
+
+              char *body = calloc(1, request->content_len + 1);
+              if (body == NULL) {
+                  httpd_resp_send_err(
+                      request, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+                  return ESP_FAIL;
+              }
+
+              int received = httpd_req_recv(
+                  request, body, request->content_len);
+              if (received <= 0) {
+                  free(body);
+                  httpd_resp_send_err(
+                      request, HTTPD_400_BAD_REQUEST, "Form receive failed");
+                  return ESP_FAIL;
+              }
+
+              char encoded_ssid[100] = "";
+              char encoded_password[180] = "";
+              char decoded_ssid[33] = "";
+              char decoded_password[65] = "";
+
+              esp_err_t ssid_result = httpd_query_key_value(
+                  body, "ssid", encoded_ssid, sizeof(encoded_ssid));
+              esp_err_t password_result = httpd_query_key_value(
+                  body, "password",
+                  encoded_password, sizeof(encoded_password));
+              free(body);
+
+              if (ssid_result != ESP_OK) {
+                  httpd_resp_send_err(
+                      request, HTTPD_400_BAD_REQUEST, "SSID is required");
+                  return ESP_FAIL;
+              }
+
+              bool ssid_decoded = url_decode(
+                  decoded_ssid, sizeof(decoded_ssid), encoded_ssid);
+              if (password_result == ESP_OK) {
+                  if (!url_decode(decoded_password,
+                                  sizeof(decoded_password),
+                                  encoded_password)) {
+                      httpd_resp_send_err(
+                          request, HTTPD_400_BAD_REQUEST,
+                          "Password is too long");
+                      return ESP_FAIL;
+                  }
+              }
+
+              if (!ssid_decoded ||
+                  decoded_ssid[0] == '\0' ||
+                  strlen(decoded_ssid) > 32 ||
+                  strlen(decoded_password) > 64) {
+                  httpd_resp_send_err(
+                      request, HTTPD_400_BAD_REQUEST, "Invalid Wi-Fi details");
+                  return ESP_FAIL;
+              }
+
+              if (save_wifi_credentials(
+                      decoded_ssid, decoded_password) != ESP_OK) {
+                  httpd_resp_send_err(
+                      request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                      "Could not save Wi-Fi details");
+                  return ESP_FAIL;
+              }
+
+              httpd_resp_set_type(request, "text/plain");
+              httpd_resp_sendstr(
+                  request,
+                  "Wi-Fi details saved. The display is restarting.");
+              vTaskDelay(pdMS_TO_TICKS(1000));
+              esp_restart();
+              return ESP_OK;
+          }
+
+          static esp_err_t local_ota_post_handler(httpd_req_t *request)
+          {
+              if (request->content_len <= 0) {
+                  httpd_resp_send_err(
+                      request, HTTPD_400_BAD_REQUEST, "Empty upload");
+                  return ESP_FAIL;
+              }
+
+              const esp_partition_t *partition =
+                  esp_ota_get_next_update_partition(NULL);
+              if (partition == NULL) {
+                  httpd_resp_send_err(
+                      request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                      "No OTA partition");
+                  return ESP_FAIL;
+              }
+
+              esp_ota_handle_t ota_handle;
+              esp_err_t error = esp_ota_begin(
+                  partition, request->content_len, &ota_handle);
+              if (error != ESP_OK) {
+                  httpd_resp_send_err(
+                      request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                      "OTA start failed");
+                  return ESP_FAIL;
+              }
+
+              char *buffer = malloc(LOCAL_OTA_BUFFER);
+              if (buffer == NULL) {
+                  esp_ota_abort(ota_handle);
+                  httpd_resp_send_err(
+                      request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                      "Out of memory");
+                  return ESP_FAIL;
+              }
+
+              int remaining = request->content_len;
+              while (remaining > 0) {
+                  int wanted =
+                      remaining > LOCAL_OTA_BUFFER ?
+                      LOCAL_OTA_BUFFER : remaining;
+                  int count = httpd_req_recv(request, buffer, wanted);
+
+                  if (count == HTTPD_SOCK_ERR_TIMEOUT) {
+                      continue;
+                  }
+                  if (count <= 0 ||
+                      esp_ota_write(ota_handle, buffer, count) != ESP_OK) {
+                      free(buffer);
+                      esp_ota_abort(ota_handle);
+                      httpd_resp_send_err(
+                          request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                          "OTA upload failed");
+                      return ESP_FAIL;
+                  }
+
+                  remaining -= count;
+              }
+
+              free(buffer);
+
+              error = esp_ota_end(ota_handle);
+              if (error != ESP_OK ||
+                  esp_ota_set_boot_partition(partition) != ESP_OK) {
+                  httpd_resp_send_err(
+                      request, HTTPD_400_BAD_REQUEST,
+                      "Invalid OTA APP firmware");
+                  return ESP_FAIL;
+              }
+
+              httpd_resp_set_type(request, "text/plain");
+              httpd_resp_sendstr(
+                  request,
+                  "Update successful. The display is restarting.");
+              vTaskDelay(pdMS_TO_TICKS(1000));
+              esp_restart();
+              return ESP_OK;
+          }
+
+          static esp_err_t check_post_handler(httpd_req_t *request)
+          {
+              if (cloud_task_handle != NULL) {
+                  xTaskNotifyGive(cloud_task_handle);
+              }
+
+              httpd_resp_set_type(request, "text/plain");
+              return httpd_resp_sendstr(request, "Cloud check requested");
+          }
+
+          static void start_web_server(void)
+          {
+              httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+              config.stack_size = 8192;
+              config.recv_wait_timeout = 60;
+              config.send_wait_timeout = 60;
+              config.max_uri_handlers = 10;
+
+              ESP_ERROR_CHECK(httpd_start(&web_server, &config));
+
+              const httpd_uri_t routes[] = {
+                  {
+                      .uri = "/",
+                      .method = HTTP_GET,
+                      .handler = index_get_handler,
+                  },
+                  {
+                      .uri = "/api/status",
+                      .method = HTTP_GET,
+                      .handler = status_get_handler,
+                  },
+                  {
+                      .uri = "/wifi",
+                      .method = HTTP_POST,
+                      .handler = wifi_post_handler,
+                  },
+                  {
+                      .uri = "/update",
+                      .method = HTTP_POST,
+                      .handler = local_ota_post_handler,
+                  },
+                  {
+                      .uri = "/check",
+                      .method = HTTP_POST,
+                      .handler = check_post_handler,
+                  },
+              };
+
+              for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); ++i) {
+                  ESP_ERROR_CHECK(
+                      httpd_register_uri_handler(web_server, &routes[i]));
+              }
+          }
+
+          static esp_err_t fetch_cloud_release(cloud_release_t *release)
+          {
+              esp_http_client_config_t config = {
+                  .url = VERSION_URL,
+                  .timeout_ms = 15000,
+                  .crt_bundle_attach = esp_crt_bundle_attach,
+                  .keep_alive_enable = true,
+              };
+
+              esp_http_client_handle_t client =
+                  esp_http_client_init(&config);
+              if (client == NULL) {
+                  return ESP_FAIL;
+              }
+
+              esp_err_t error = esp_http_client_open(client, 0);
+              if (error != ESP_OK) {
+                  esp_http_client_cleanup(client);
+                  return error;
+              }
+
+              esp_http_client_fetch_headers(client);
+              int status = esp_http_client_get_status_code(client);
+              if (status != 200) {
+                  esp_http_client_close(client);
+                  esp_http_client_cleanup(client);
+                  return ESP_FAIL;
+              }
+
+              char *response = calloc(1, VERSION_RESPONSE_MAX);
+              if (response == NULL) {
+                  esp_http_client_close(client);
+                  esp_http_client_cleanup(client);
+                  return ESP_ERR_NO_MEM;
+              }
+
+              int total = 0;
+              while (total < VERSION_RESPONSE_MAX - 1) {
+                  int count = esp_http_client_read(
+                      client,
+                      response + total,
+                      VERSION_RESPONSE_MAX - 1 - total);
+                  if (count < 0) {
+                      free(response);
+                      esp_http_client_close(client);
+                      esp_http_client_cleanup(client);
+                      return ESP_FAIL;
+                  }
+                  if (count == 0) {
+                      break;
+                  }
+                  total += count;
+              }
+
+              esp_http_client_close(client);
+              esp_http_client_cleanup(client);
+              response[total] = '\0';
+
+              cJSON *root = cJSON_Parse(response);
+              free(response);
+              if (root == NULL) {
+                  return ESP_FAIL;
+              }
+
+              cJSON *build = cJSON_GetObjectItemCaseSensitive(root, "build");
+              cJSON *version =
+                  cJSON_GetObjectItemCaseSensitive(root, "version");
+              cJSON *firmware =
+                  cJSON_GetObjectItemCaseSensitive(root, "firmware_url");
+
+              if (!cJSON_IsNumber(build) ||
+                  !cJSON_IsString(version) ||
+                  !cJSON_IsString(firmware)) {
+                  cJSON_Delete(root);
+                  return ESP_FAIL;
+              }
+
+              release->build = build->valueint;
+              strlcpy(release->version, version->valuestring,
+                      sizeof(release->version));
+              strlcpy(release->firmware_url, firmware->valuestring,
+                      sizeof(release->firmware_url));
+              cJSON_Delete(root);
+              return ESP_OK;
+          }
+
+          static esp_err_t install_cloud_release(
+              const cloud_release_t *release)
+          {
+              esp_http_client_config_t http_config = {
+                  .url = release->firmware_url,
+                  .timeout_ms = 30000,
+                  .crt_bundle_attach = esp_crt_bundle_attach,
+                  .keep_alive_enable = true,
+              };
+
+              esp_https_ota_config_t ota_config = {
+                  .http_config = &http_config,
+                  .bulk_flash_erase = false,
+              };
+
+              return esp_https_ota(&ota_config);
+          }
+
+          static void cloud_update_task(void *argument)
+          {
+              (void)argument;
+              cloud_task_handle = xTaskGetCurrentTaskHandle();
+
+              while (true) {
+                  xEventGroupWaitBits(
+                      wifi_events,
+                      WIFI_CONNECTED_BIT,
+                      pdFALSE,
+                      pdTRUE,
+                      portMAX_DELAY);
+
+                  cloud_release_t release = {0};
+                  ui_set_text(
+                      cloud_status_label,
+                      "Cloud: checking colassn.github.io...");
+
+                  esp_err_t error = fetch_cloud_release(&release);
+                  if (error != ESP_OK) {
+                      ui_set_text(
+                          cloud_status_label,
+                          "Cloud: manifest unavailable");
+                  } else if (release.build > FIRMWARE_BUILD) {
+                      char text[96];
+                      snprintf(text, sizeof(text),
+                               "Cloud: updating to %s", release.version);
+                      ui_set_text(cloud_status_label, text);
+
+                      error = install_cloud_release(&release);
+                      if (error == ESP_OK) {
+                          ui_set_text(
+                              cloud_status_label,
+                              "Cloud: update complete, restarting");
+                          vTaskDelay(pdMS_TO_TICKS(1200));
+                          esp_restart();
+                      } else {
+                          ui_set_text(
+                              cloud_status_label,
+                              "Cloud: update failed; local OTA still available");
+                      }
+                  } else {
+                      char text[96];
+                      snprintf(text, sizeof(text),
+                               "Cloud: %s is up to date", FIRMWARE_VERSION);
+                      ui_set_text(cloud_status_label, text);
+                  }
+
+                  ulTaskNotifyTake(
+                      pdTRUE, pdMS_TO_TICKS(CLOUD_CHECK_INTERVAL_MS));
+              }
+          }
+
+          void app_main(void)
+          {
+              ESP_ERROR_CHECK(initialise_nvs());
+
+              sunton_esp32s3_backlight_init();
+              lv_display_t *display = sunton_esp32s3_lcd_init();
+              (void)display;
+
+              i2c_master_bus_handle_t i2c_master =
+                  sunton_esp32s3_i2c_master();
+              sunton_esp32s3_touch_init(i2c_master);
+
+              lv_lock();
+              create_bus_ui();
+              lv_unlock();
+
+              start_wifi();
+              start_web_server();
+
+              xTaskCreate(
+                  cloud_update_task,
+                  "cloud_update",
+                  12288,
+                  NULL,
+                  4,
+                  &cloud_task_handle);
+
+              ESP_LOGI(
+                  TAG,
+                  "Firmware %s build %d",
+                  FIRMWARE_VERSION,
+                  FIRMWARE_BUILD);
+              ESP_LOGI(
+                  TAG,
+                  "Setup hotspot: %s, password: %s",
+                  SETUP_AP_SSID,
+                  SETUP_AP_PASS);
+              ESP_LOGI(
+                  TAG,
+                  "Local management: http://192.168.4.1 or http://busdisplay.local");
+          }
+          MAIN_C
+
+          cat > project/main/CMakeLists.txt <<'CMAKE'
+          idf_component_register(
+              SRCS "main.c" "sunton_esp32_8048s050c.c"
+              INCLUDE_DIRS "."
+              REQUIRES
+                  lvgl
+                  esp_lcd
+                  esp_lcd_touch_gt911
+                  esp_timer
+                  nvs_flash
+                  esp_wifi
+                  esp_netif
+                  esp_event
+                  esp_http_server
+                  esp_http_client
+                  esp_https_ota
+                  app_update
+                  mdns
+                  json
+                  mbedtls
+          )
+
+          target_compile_definitions(
+              ${COMPONENT_LIB}
+              PRIVATE
+                  FIRMWARE_BUILD=__BUILD_NUMBER__
+                  FIRMWARE_VERSION=\"1.1.__BUILD_NUMBER__\"
+          )
+          CMAKE
+
+          sed -i "s/__BUILD_NUMBER__/${BUILD_NUMBER}/g" \
+            project/main/CMakeLists.txt
+
+          cat > project/main/idf_component.yml <<'COMPONENTS'
+          dependencies:
+            espressif/esp_lcd_touch_gt911: "^1.2.0"
+            lvgl/lvgl:
+              version: "=9.4.0"
+            espressif/mdns: "^1.11.3"
+            idf:
+              version: ">=5.5.2"
+          COMPONENTS
+
+          cat > project/partitions_ota.csv <<'PARTITIONS'
+          # Name,    Type, SubType, Offset,   Size,     Flags
+          nvs,       data, nvs,     0x9000,   0x4000,
+          otadata,   data, ota,     0xd000,   0x2000,
+          phy_init,  data, phy,     0xf000,   0x1000,
+          factory,   app,  factory, 0x10000,  0x400000,
+          ota_0,     app,  ota_0,   0x410000, 0x400000,
+          ota_1,     app,  ota_1,   0x810000, 0x400000,
+          storage,   data, spiffs,  0xc10000, 0x3f0000,
+          PARTITIONS
+
+          sed -i '/CONFIG_PARTITION_TABLE_/d' project/sdkconfig.defaults
+          cat >> project/sdkconfig.defaults <<'SDK'
+          CONFIG_PARTITION_TABLE_CUSTOM=y
+          CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_ota.csv"
+          CONFIG_PARTITION_TABLE_FILENAME="partitions_ota.csv"
+
+          CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+          CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+
+          CONFIG_LV_FONT_MONTSERRAT_14=y
+          CONFIG_LV_FONT_MONTSERRAT_20=y
+          CONFIG_LV_FONT_MONTSERRAT_28=y
+          CONFIG_LV_FONT_MONTSERRAT_32=y
+          CONFIG_LV_FONT_MONTSERRAT_36=y
+          SDK
+
+      - name: Build ESP32 firmware
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE/project:/project" \
+            -w /project \
+            "$IDF_IMAGE" \
+            bash -lc '
+              set -e
+              . /opt/esp/idf/export.sh
+              idf.py set-target esp32s3
+              idf.py build
+              idf.py merge-bin -f raw
+
+              cp build/ESP32-8048S050C.bin \
+                 /project/ESP32-BUS-DISPLAY-OTA-APP.bin
+              cp build/merged-binary.bin \
+                 /project/ESP32-BUS-DISPLAY-FULL.bin
+            '
+
+      - name: Create GitHub Pages release site
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+          SHORT_SHA: ${{ github.sha }}
+        run: |
+          mkdir -p site/firmware
+          cp project/ESP32-BUS-DISPLAY-OTA-APP.bin \
+             site/firmware/ESP32-BUS-DISPLAY-OTA-APP.bin
+
+          FIRMWARE_SHA256="$(sha256sum \
+            site/firmware/ESP32-BUS-DISPLAY-OTA-APP.bin | awk '{print $1}')"
+
+          cat > site/version.json <<EOF
+          {
+            "version": "1.1.${BUILD_NUMBER}",
+            "build": ${BUILD_NUMBER},
+            "firmware_url": "${PAGES_BASE_URL}/firmware/ESP32-BUS-DISPLAY-OTA-APP.bin",
+            "sha256": "${FIRMWARE_SHA256}",
+            "commit": "${SHORT_SHA}",
+            "published_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+
+          cat > site/index.html <<'HTML'
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width,initial-scale=1">
+            <title>Bus Display Control</title>
+            <style>
+              :root{color-scheme:light;--ink:#17222b;--muted:#69757e;
+              --bg:#eef1f4;--card:#fff;--red:#c9152b;--green:#167a62}
+              *{box-sizing:border-box}body{margin:0;background:var(--bg);
+              color:var(--ink);font-family:system-ui,-apple-system,sans-serif}
+              main{max-width:760px;margin:0 auto;padding:30px 20px 60px}
+              .hero{background:var(--red);color:white;padding:28px;
+              border-radius:22px;margin-bottom:18px}
+              .route{display:inline-block;background:#ffd447;color:#171717;
+              font-weight:850;font-size:26px;padding:8px 15px;border-radius:11px}
+              h1{font-size:36px;margin:20px 0 6px}.hero p{color:#ffe8eb}
+              .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));
+              gap:16px}.card{background:var(--card);padding:22px;border-radius:17px;
+              box-shadow:0 8px 28px #17222b12}h2{margin-top:0}
+              p{color:var(--muted);line-height:1.55}.value{font-size:24px;
+              font-weight:800;color:var(--ink)}
+              a.button{display:inline-block;text-decoration:none;background:var(--green);
+              color:white;font-weight:750;padding:12px 16px;border-radius:10px}
+              code{background:#edf0f2;padding:2px 6px;border-radius:6px}
+              .note{font-size:13px}.dot{display:inline-block;width:10px;height:10px;
+              background:var(--green);border-radius:50%;margin-right:7px}
+            </style>
+          </head>
+          <body><main>
+            <section class="hero">
+              <span class="route">962B</span>
+              <h1>Bus Display Control</h1>
+              <p>Public firmware channel for the ESP32-8048S050C arrival display.</p>
+            </section>
+            <section class="grid">
+              <article class="card">
+                <h2><span class="dot"></span>Latest cloud release</h2>
+                <div id="version" class="value">Loading…</div>
+                <p id="published">Checking version.json</p>
+                <a class="button" href="firmware/ESP32-BUS-DISPLAY-OTA-APP.bin">
+                  Download OTA APP
+                </a>
+              </article>
+              <article class="card">
+                <h2>How updating works</h2>
+                <p>The display checks this site every five minutes. When a newer
+                build is published, it downloads the OTA APP over HTTPS, validates
+                it and restarts automatically.</p>
+                <p class="note">The public site cannot directly enter your home
+                network. The display securely pulls the update itself.</p>
+              </article>
+              <article class="card">
+                <h2>Local management</h2>
+                <p>While connected to the same home Wi-Fi, open
+                <code>http://busdisplay.local</code>.</p>
+                <p>Recovery hotspot: <code>BusDisplay-Setup</code><br>
+                Password: <code>esp32ota88</code><br>
+                Address: <code>http://192.168.4.1</code></p>
+              </article>
+              <article class="card">
+                <h2>Current screen</h2>
+                <p>Route 962B, Tuen Mun Town Centre, with three simulated arrival
+                countdowns. Live Hong Kong bus data is the next integration step.</p>
+              </article>
+            </section>
+          </main>
+          <script>
+            fetch('version.json?ts='+Date.now(),{cache:'no-store'})
+              .then(r=>r.json())
+              .then(v=>{
+                document.getElementById('version').textContent=
+                  `${v.version} · build ${v.build}`;
+                document.getElementById('published').textContent=
+                  `Published ${v.published_utc}`;
+              })
+              .catch(()=>{
+                document.getElementById('version').textContent='Unavailable';
+              });
+          </script></body></html>
+          HTML
+
+          touch site/.nojekyll
+
+      - name: Upload downloadable firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ESP32-Bus-Display-cloud-OTA
+          path: |
+            project/ESP32-BUS-DISPLAY-OTA-APP.bin
+            project/ESP32-BUS-DISPLAY-FULL.bin
+            site/version.json
+          if-no-files-found: error
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
