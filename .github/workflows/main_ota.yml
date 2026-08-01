@@ -1,0 +1,371 @@
+name: Build ESP32-8048S050C OTA Firmware
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clone working display project
+        run: |
+          git clone --depth 1 https://github.com/mr-sven/esp32-8048S050C.git project
+
+      - name: Add local Wi-Fi web OTA
+        run: |
+          cat > project/main/main.c <<'MAIN_C'
+          #include <stdlib.h>
+          #include <string.h>
+
+          #include "freertos/FreeRTOS.h"
+          #include "freertos/task.h"
+
+          #include "esp_event.h"
+          #include "esp_http_server.h"
+          #include "esp_log.h"
+          #include "esp_netif.h"
+          #include "esp_ota_ops.h"
+          #include "esp_system.h"
+          #include "esp_wifi.h"
+          #include "nvs_flash.h"
+
+          #include "driver/i2c_master.h"
+          #include "lvgl.h"
+          #include "demos/lv_demos.h"
+
+          #include "sunton_esp32_8048s050c.h"
+
+          #define OTA_AP_SSID "ESP32-Display-OTA"
+          #define OTA_AP_PASS "esp32ota88"
+          #define OTA_BUF_SIZE 4096
+
+          static const char *TAG = "web_ota";
+          static httpd_handle_t ota_server = NULL;
+
+          static const char OTA_PAGE[] =
+              "<!doctype html><html><head>"
+              "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+              "<title>ESP32 Display OTA</title>"
+              "<style>"
+              "body{font-family:sans-serif;max-width:560px;margin:40px auto;padding:20px;"
+              "background:#f4f7f7;color:#173332}"
+              ".box{background:white;padding:24px;border-radius:16px;box-shadow:0 6px 24px #0002}"
+              "button{width:100%;padding:15px;margin-top:16px;border:0;border-radius:10px;"
+              "background:#138b7e;color:white;font-size:18px}"
+              "input{width:100%;margin-top:14px}"
+              "#s{white-space:pre-wrap;margin-top:16px}"
+              "</style></head><body><div class='box'>"
+              "<h2>ESP32-8048S050C OTA</h2>"
+              "<p>Select the <b>OTA APP .bin</b>, not the FULL/merged file.</p>"
+              "<input id='f' type='file' accept='.bin'>"
+              "<button onclick='upload()'>Upload and restart</button>"
+              "<div id='s'>Ready.</div>"
+              "</div><script>"
+              "async function upload(){"
+              "const f=document.getElementById('f').files[0];"
+              "const s=document.getElementById('s');"
+              "if(!f){s.textContent='Please choose a .bin file first.';return;}"
+              "if(!confirm('Upload '+f.name+'?'))return;"
+              "s.textContent='Uploading... Keep this page open.';"
+              "try{"
+              "const r=await fetch('/update',{method:'POST',"
+              "headers:{'Content-Type':'application/octet-stream'},body:f});"
+              "s.textContent=await r.text();"
+              "}catch(e){s.textContent='Connection closed. The board may be restarting.';}"
+              "}"
+              "</script></body></html>";
+
+          static esp_err_t ota_index_get(httpd_req_t *req)
+          {
+              httpd_resp_set_type(req, "text/html");
+              httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+              return httpd_resp_send(req, OTA_PAGE, HTTPD_RESP_USE_STRLEN);
+          }
+
+          static esp_err_t ota_update_post(httpd_req_t *req)
+          {
+              if (req->content_len <= 0) {
+                  httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty upload");
+                  return ESP_FAIL;
+              }
+
+              const esp_partition_t *update_partition =
+                  esp_ota_get_next_update_partition(NULL);
+              if (update_partition == NULL) {
+                  httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                      "No OTA partition found");
+                  return ESP_FAIL;
+              }
+
+              ESP_LOGI(TAG, "Writing %d bytes to %s at 0x%lx",
+                       req->content_len, update_partition->label,
+                       (unsigned long)update_partition->address);
+
+              esp_ota_handle_t update_handle = 0;
+              esp_err_t err =
+                  esp_ota_begin(update_partition, req->content_len, &update_handle);
+              if (err != ESP_OK) {
+                  ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
+                  httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                      "OTA begin failed");
+                  return ESP_FAIL;
+              }
+
+              char *buffer = malloc(OTA_BUF_SIZE);
+              if (buffer == NULL) {
+                  esp_ota_abort(update_handle);
+                  httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                      "Out of memory");
+                  return ESP_FAIL;
+              }
+
+              int remaining = req->content_len;
+              int written = 0;
+
+              while (remaining > 0) {
+                  int wanted = remaining > OTA_BUF_SIZE ? OTA_BUF_SIZE : remaining;
+                  int received = httpd_req_recv(req, buffer, wanted);
+
+                  if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+                      continue;
+                  }
+                  if (received <= 0) {
+                      ESP_LOGE(TAG, "Upload receive failed: %d", received);
+                      free(buffer);
+                      esp_ota_abort(update_handle);
+                      httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                          "Upload interrupted");
+                      return ESP_FAIL;
+                  }
+
+                  err = esp_ota_write(update_handle, buffer, received);
+                  if (err != ESP_OK) {
+                      ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(err));
+                      free(buffer);
+                      esp_ota_abort(update_handle);
+                      httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                          "Flash write failed");
+                      return ESP_FAIL;
+                  }
+
+                  remaining -= received;
+                  written += received;
+
+                  if ((written % (256 * 1024)) < received || remaining == 0) {
+                      ESP_LOGI(TAG, "OTA progress: %d / %d bytes",
+                               written, req->content_len);
+                  }
+              }
+
+              free(buffer);
+
+              err = esp_ota_end(update_handle);
+              if (err != ESP_OK) {
+                  ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(err));
+                  httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                      "Invalid or incompatible APP firmware");
+                  return ESP_FAIL;
+              }
+
+              err = esp_ota_set_boot_partition(update_partition);
+              if (err != ESP_OK) {
+                  ESP_LOGE(TAG, "set boot partition failed: %s",
+                           esp_err_to_name(err));
+                  httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                      "Could not select new firmware");
+                  return ESP_FAIL;
+              }
+
+              httpd_resp_set_type(req, "text/plain");
+              httpd_resp_sendstr(req,
+                  "Update successful. The display is restarting now.");
+              ESP_LOGI(TAG, "OTA complete; restarting");
+              vTaskDelay(pdMS_TO_TICKS(1200));
+              esp_restart();
+              return ESP_OK;
+          }
+
+          static void start_ota_server(void)
+          {
+              httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+              config.stack_size = 8192;
+              config.recv_wait_timeout = 60;
+              config.send_wait_timeout = 60;
+              config.max_uri_handlers = 6;
+
+              ESP_ERROR_CHECK(httpd_start(&ota_server, &config));
+
+              const httpd_uri_t index_uri = {
+                  .uri = "/",
+                  .method = HTTP_GET,
+                  .handler = ota_index_get,
+                  .user_ctx = NULL,
+              };
+
+              const httpd_uri_t update_uri = {
+                  .uri = "/update",
+                  .method = HTTP_POST,
+                  .handler = ota_update_post,
+                  .user_ctx = NULL,
+              };
+
+              ESP_ERROR_CHECK(httpd_register_uri_handler(ota_server, &index_uri));
+              ESP_ERROR_CHECK(httpd_register_uri_handler(ota_server, &update_uri));
+          }
+
+          static void start_ota_softap(void)
+          {
+              esp_err_t err = nvs_flash_init();
+              if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
+                  err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+                  ESP_ERROR_CHECK(nvs_flash_erase());
+                  ESP_ERROR_CHECK(nvs_flash_init());
+              } else {
+                  ESP_ERROR_CHECK(err);
+              }
+
+              ESP_ERROR_CHECK(esp_netif_init());
+              ESP_ERROR_CHECK(esp_event_loop_create_default());
+              esp_netif_create_default_wifi_ap();
+
+              wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+              ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+              wifi_config_t wifi_config = {0};
+              strlcpy((char *)wifi_config.ap.ssid, OTA_AP_SSID,
+                      sizeof(wifi_config.ap.ssid));
+              strlcpy((char *)wifi_config.ap.password, OTA_AP_PASS,
+                      sizeof(wifi_config.ap.password));
+              wifi_config.ap.ssid_len = strlen(OTA_AP_SSID);
+              wifi_config.ap.channel = 1;
+              wifi_config.ap.max_connection = 4;
+              wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+              wifi_config.ap.pmf_cfg.required = false;
+
+              ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+              ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+              ESP_ERROR_CHECK(esp_wifi_start());
+
+              ESP_LOGI(TAG, "OTA Wi-Fi ready");
+              ESP_LOGI(TAG, "SSID: %s", OTA_AP_SSID);
+              ESP_LOGI(TAG, "Password: %s", OTA_AP_PASS);
+              ESP_LOGI(TAG, "Open: http://192.168.4.1");
+
+              start_ota_server();
+          }
+
+          void app_main(void)
+          {
+              /*
+               * Start OTA first. If the UI is later modified, the OTA service
+               * remains available as early as possible in the boot process.
+               */
+              start_ota_softap();
+
+              sunton_esp32s3_backlight_init();
+              lv_display_t *disp = sunton_esp32s3_lcd_init();
+              (void)disp;
+
+              i2c_master_bus_handle_t i2c_master =
+                  sunton_esp32s3_i2c_master();
+              sunton_esp32s3_touch_init(i2c_master);
+
+              lv_lock();
+              lv_demo_widgets();
+
+              lv_obj_t *ota_label = lv_label_create(lv_layer_top());
+              lv_label_set_text(
+                  ota_label,
+                  "OTA: ESP32-Display-OTA | 192.168.4.1 | PW: esp32ota88");
+              lv_obj_set_style_bg_color(
+                  ota_label, lv_color_hex(0x173332), LV_PART_MAIN);
+              lv_obj_set_style_bg_opa(ota_label, LV_OPA_80, LV_PART_MAIN);
+              lv_obj_set_style_text_color(
+                  ota_label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+              lv_obj_set_style_pad_all(ota_label, 6, LV_PART_MAIN);
+              lv_obj_set_style_radius(ota_label, 6, LV_PART_MAIN);
+              lv_obj_align(ota_label, LV_ALIGN_BOTTOM_MID, 0, -4);
+              lv_unlock();
+          }
+          MAIN_C
+
+          cat > project/main/CMakeLists.txt <<'CMAKE'
+          idf_component_register(
+              SRCS "main.c" "sunton_esp32_8048s050c.c"
+              INCLUDE_DIRS "."
+              REQUIRES
+                  lvgl
+                  esp_lcd
+                  esp_lcd_touch_gt911
+                  esp_timer
+                  nvs_flash
+                  esp_wifi
+                  esp_netif
+                  esp_event
+                  esp_http_server
+                  app_update
+          )
+          CMAKE
+
+          cat > project/partitions_ota.csv <<'PARTITIONS'
+          # Name,    Type, SubType, Offset,   Size,     Flags
+          nvs,       data, nvs,     0x9000,   0x4000,
+          otadata,   data, ota,     0xd000,   0x2000,
+          phy_init,  data, phy,     0xf000,   0x1000,
+          factory,   app,  factory, 0x10000,  0x400000,
+          ota_0,     app,  ota_0,   0x410000, 0x400000,
+          ota_1,     app,  ota_1,   0x810000, 0x400000,
+          storage,   data, spiffs,  0xc10000, 0x3f0000,
+          PARTITIONS
+
+          sed -i '/CONFIG_PARTITION_TABLE_/d' project/sdkconfig.defaults
+          cat >> project/sdkconfig.defaults <<'SDK'
+          CONFIG_PARTITION_TABLE_CUSTOM=y
+          CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_ota.csv"
+          CONFIG_PARTITION_TABLE_FILENAME="partitions_ota.csv"
+          SDK
+
+      - name: Build OTA-enabled firmware
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE/project:/project" \
+            -w /project \
+            espressif/idf:v5.5.2 \
+            bash -lc '
+              set -e
+              . /opt/esp/idf/export.sh
+              idf.py set-target esp32s3
+              idf.py build
+              idf.py merge-bin -f raw
+
+              cp build/merged-binary.bin \
+                 /project/ESP32-8048S050C_OTA_FULL.bin
+              cp build/ESP32-8048S050C.bin \
+                 /project/ESP32-8048S050C_OTA_APP.bin
+
+              cat > /project/README_OTA.txt <<EOF
+          FIRST INSTALL BY USB:
+          Flash ESP32-8048S050C_OTA_FULL.bin at offset 0x0.
+          Use spiMode KEEP, spiFreq KEEP, flashSize KEEP.
+
+          LATER WIRELESS UPDATES:
+          1. Connect phone Wi-Fi to ESP32-Display-OTA
+          2. Password: esp32ota88
+          3. Open http://192.168.4.1
+          4. Upload ESP32-8048S050C_OTA_APP.bin
+          Never upload the FULL file on the OTA web page.
+          EOF
+
+              ls -lh /project/ESP32-8048S050C_OTA_*.bin
+            '
+
+      - name: Upload firmware package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ESP32-8048S050C-OTA-firmware
+          path: |
+            project/ESP32-8048S050C_OTA_FULL.bin
+            project/ESP32-8048S050C_OTA_APP.bin
+            project/README_OTA.txt
+          if-no-files-found: error
