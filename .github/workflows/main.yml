@@ -15,24 +15,31 @@ jobs:
       - name: Build firmware with ESP-IDF
         run: |
           docker run --rm \
-            -v "$PWD/project:/project" \
+            -v "$GITHUB_WORKSPACE/project:/project" \
             -w /project \
             espressif/idf:v5.5.2 \
             bash -lc '
+              set -e
               . /opt/esp/idf/export.sh
+
               idf.py set-target esp32s3
               idf.py build
-              idf.py merge-bin -o build/ESP32-8048S050C_full.bin
+              idf.py merge-bin -f raw
+
+              cp build/merged-binary.bin \
+                 /project/ESP32-8048S050C_full.bin
+
+              ls -lh /project/ESP32-8048S050C_full.bin
             '
 
-      - name: Check generated firmware
+      - name: Verify firmware
         run: |
-          ls -lh project/build/
-          test -f project/build/ESP32-8048S050C_full.bin
+          test -s project/ESP32-8048S050C_full.bin
+          ls -lh project/ESP32-8048S050C_full.bin
 
       - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
           name: ESP32-8048S050C-firmware
-          path: project/build/ESP32-8048S050C_full.bin
+          path: project/ESP32-8048S050C_full.bin
           if-no-files-found: error
