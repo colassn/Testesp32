@@ -1,0 +1,217 @@
+name: STEP 4B - Stable Display Fix
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout your repository
+        uses: actions/checkout@v4
+
+      - name: Recreate STEP 4 and apply display stability fix
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE_WORKFLOW=".github/workflows/step4_html_clock_engine.yml"
+
+          if [ ! -f "$SOURCE_WORKFLOW" ]; then
+            echo "Cannot find $SOURCE_WORKFLOW"
+            echo "Keep the original STEP 4 workflow in the repository."
+            exit 1
+          fi
+
+          rm -rf project
+          git clone --depth 1 https://github.com/mr-sven/esp32-8048S050C.git project
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          source_path = Path(".github/workflows/step4_html_clock_engine.yml")
+          source = source_path.read_text(encoding="utf-8").splitlines()
+
+          def extract(marker: str) -> str:
+              start_token = f"<<'{marker}'"
+              start = None
+              end = None
+
+              for index, line in enumerate(source):
+                  if start_token in line:
+                      start = index + 1
+                      break
+
+              if start is None:
+                  raise RuntimeError(f"Cannot find heredoc start: {marker}")
+
+              for index in range(start, len(source)):
+                  if source[index].strip() == marker:
+                      end = index
+                      break
+
+              if end is None:
+                  raise RuntimeError(f"Cannot find heredoc end: {marker}")
+
+              output_lines = []
+              for line in source[start:end]:
+                  # Remove the ten-space YAML indentation used by the original workflow.
+                  if line.startswith("          "):
+                      line = line[10:]
+                  output_lines.append(line)
+
+              return "\n".join(output_lines) + "\n"
+
+          outputs = {
+              "MAIN_C": Path("project/main/main.c"),
+              "CMAKE": Path("project/main/CMakeLists.txt"),
+              "PARTITIONS": Path("project/partitions_ota.csv"),
+              "DISPLAY_HTML": Path("project/display.html"),
+          }
+
+          for marker, output_path in outputs.items():
+              output_path.parent.mkdir(parents=True, exist_ok=True)
+              output_path.write_text(extract(marker), encoding="utf-8")
+              print(f"Extracted {marker} -> {output_path}")
+
+          sdk_path = Path("project/sdkconfig.defaults")
+          sdk_text = sdk_path.read_text(encoding="utf-8")
+
+          # Remove the old partition-table choices before applying the STEP 4 OTA table.
+          sdk_lines = [
+              line for line in sdk_text.splitlines()
+              if not line.startswith("CONFIG_PARTITION_TABLE_")
+              and not line.startswith("# CONFIG_PARTITION_TABLE_")
+          ]
+          sdk_path.write_text(
+              "\n".join(sdk_lines) + "\n\n" + extract("SDK"),
+              encoding="utf-8",
+          )
+
+          # Force the stable LCD mode:
+          # - one RGB framebuffer instead of two direct-mode framebuffers
+          # - LVGL uses a small internal-RAM partial draw buffer
+          # This avoids framebuffer swapping whenever Save / Restore / theme redraws the UI.
+          sdk_text = sdk_path.read_text(encoding="utf-8")
+          filtered = []
+          for line in sdk_text.splitlines():
+              if "CONFIG_SUNTON_ESP32_DOUBLE_FB" in line:
+                  continue
+              if "CONFIG_SUNTON_ESP32_DOUBLE_FB_TEARING" in line:
+                  continue
+              if "CONFIG_SUNTON_ESP32_USE_BOUNCE_BUFFER" in line:
+                  continue
+              filtered.append(line)
+
+          filtered.extend([
+              "",
+              "# Stable single-framebuffer LCD mode",
+              "# CONFIG_SUNTON_ESP32_DOUBLE_FB is not set",
+              "# CONFIG_SUNTON_ESP32_DOUBLE_FB_TEARING is not set",
+              "# CONFIG_SUNTON_ESP32_USE_BOUNCE_BUFFER is not set",
+          ])
+          sdk_path.write_text("\n".join(filtered) + "\n", encoding="utf-8")
+
+          # Lower the RGB pixel clock slightly for additional timing margin.
+          driver_path = Path("project/main/sunton_esp32_8048s050c.c")
+          driver = driver_path.read_text(encoding="utf-8")
+          driver = driver.replace(
+              ".pclk_hz = (14*1000000),",
+              ".pclk_hz = (12*1000000),",
+          )
+          driver_path.write_text(driver, encoding="utf-8")
+
+          # Request a complete refresh after HTML is rebuilt.
+          main_path = Path("project/main/main.c")
+          main = main_path.read_text(encoding="utf-8")
+
+          old = """              render_display_html(html);
+              free(html);
+          }
+
+          static void reload_display_async"""
+          new = """              render_display_html(html);
+              free(html);
+
+              /*
+               * Force LVGL to repaint the whole 800 x 480 screen after an
+               * HTML save/restore.  In stable single-framebuffer mode this
+               * prevents stale areas from a previous layout.
+               */
+              lv_obj_invalidate(lv_screen_active());
+              lv_refr_now(NULL);
+          }
+
+          static void reload_display_async"""
+
+          if old in main:
+              main = main.replace(old, new, 1)
+          else:
+              print("Note: full-refresh insertion point not found; framebuffer fix still applies.")
+
+          main_path.write_text(main, encoding="utf-8")
+          PY
+
+          echo "---- Stability configuration ----"
+          grep -E "SUNTON_ESP32_(DOUBLE_FB|USE_BOUNCE_BUFFER)" \
+            project/sdkconfig.defaults || true
+          grep -n "pclk_hz" project/main/sunton_esp32_8048s050c.c || true
+
+      - name: Build stable firmware
+        shell: bash
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE/project:/project" \
+            -w /project \
+            espressif/idf:v5.5.2 \
+            bash -lc '
+              set -e
+              git config --global --add safe.directory /project
+              . /opt/esp/idf/export.sh
+
+              rm -rf build sdkconfig
+              idf.py set-target esp32s3
+              idf.py build
+              idf.py merge-bin -f raw
+
+              cp build/merged-binary.bin \
+                 /project/STEP4B-STABLE-DISPLAY-FULL.bin
+
+              cp build/ESP32-8048S050C.bin \
+                 /project/STEP4B-STABLE-DISPLAY-OTA-APP.bin
+
+              ls -lh /project/STEP4B-STABLE-DISPLAY-*.bin
+            '
+
+      - name: Add instructions
+        shell: bash
+        run: |
+          cat > project/READ-ME-FIRST.txt <<'TXT'
+          STEP 4B - Stable Display Fix
+
+          Use this file through the ESP32 web OTA page:
+          STEP4B-STABLE-DISPLAY-OTA-APP.bin
+
+          Do NOT upload the FULL.bin file through OTA.
+
+          This build changes the LCD to stable single-framebuffer partial-render mode.
+          It is intended to fix the screen shifting after:
+          - Save and show
+          - Restore default
+          - changing the theme
+          - redrawing the interface
+
+          The existing display.html stored in SPIFFS is retained during normal OTA.
+          TXT
+
+      - name: Upload stable firmware package
+        uses: actions/upload-artifact@v4
+        with:
+          name: STEP4B-Stable-Display-Fix
+          path: |
+            project/STEP4B-STABLE-DISPLAY-OTA-APP.bin
+            project/STEP4B-STABLE-DISPLAY-FULL.bin
+            project/display.html
+            project/READ-ME-FIRST.txt
+          if-no-files-found: error
