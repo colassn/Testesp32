@@ -54,7 +54,6 @@ jobs:
               "https://data.weather.gov.hk/weatherAPI/opendata/weather.php" \
               "?dataType=rhrread&lang=en"
 
-          static const char *TAG = "step2_clock";
           static EventGroupHandle_t wifi_events;
           static httpd_handle_t web_server;
 
@@ -407,7 +406,10 @@ jobs:
               struct timeval now;
               struct tm local_time;
               char clock_buffer[16];
-              char millis_buffer[8];
+              // 16 bytes avoids GCC -Wformat-truncation because
+              // suseconds_t is a signed long even though tv_usec is normally
+              // in the 0..999999 range.
+              char millis_buffer[16];
               char date_buffer[32];
 
               gettimeofday(&now, NULL);
