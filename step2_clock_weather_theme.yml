@@ -1,0 +1,1188 @@
+name: STEP 2 - Clock Weather Theme
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clone proven display project
+        run: |
+          git clone --depth 1 https://github.com/mr-sven/esp32-8048S050C.git project
+
+      - name: Add clock weather theme and local OTA
+        run: |
+          cat > project/main/main.c <<'MAIN_C'
+          #include <stdbool.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/time.h>
+          #include <time.h>
+
+          #include "freertos/FreeRTOS.h"
+          #include "freertos/event_groups.h"
+          #include "freertos/task.h"
+
+          #include "cJSON.h"
+          #include "driver/i2c_master.h"
+          #include "esp_crt_bundle.h"
+          #include "esp_event.h"
+          #include "esp_http_client.h"
+          #include "esp_http_server.h"
+          #include "esp_log.h"
+          #include "esp_netif.h"
+          #include "esp_netif_sntp.h"
+          #include "esp_ota_ops.h"
+          #include "esp_system.h"
+          #include "esp_wifi.h"
+          #include "nvs.h"
+          #include "nvs_flash.h"
+
+          #include "lvgl.h"
+          #include "sunton_esp32_8048s050c.h"
+
+          #define SETUP_AP_SSID "ESP32-Display-OTA"
+          #define SETUP_AP_PASS "esp32ota88"
+          #define WIFI_CONNECTED_BIT BIT0
+          #define LOCAL_OTA_BUFFER 4096
+          #define WEATHER_BUFFER_SIZE 24576
+          #define WEATHER_URL \
+              "https://data.weather.gov.hk/weatherAPI/opendata/weather.php" \
+              "?dataType=rhrread&lang=en"
+
+          static const char *TAG = "step2_clock";
+          static EventGroupHandle_t wifi_events;
+          static httpd_handle_t web_server;
+
+          static char saved_ssid[33];
+          static char saved_password[65];
+          static char wifi_status_text[96] = "Wi-Fi: setup hotspot ready";
+          static char weather_text[96] = "WEATHER: connect home Wi-Fi";
+          static bool dark_mode = false;
+          static bool sntp_started = false;
+
+          static lv_obj_t *clock_label;
+          static lv_obj_t *millis_label;
+          static lv_obj_t *date_label;
+          static lv_obj_t *weather_label;
+          static lv_obj_t *wifi_label;
+          static lv_obj_t *updated_label;
+          static lv_obj_t *eta_labels[3];
+
+          static int eta_seconds[3] = {180, 660, 1440};
+          static uint32_t refresh_count = 0;
+
+          static const char MANAGEMENT_PAGE[] =
+              "<!doctype html><html><head>"
+              "<meta charset='utf-8'>"
+              "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+              "<title>Bus Clock Display</title>"
+              "<style>"
+              "*{box-sizing:border-box}body{margin:0;background:#eef1f4;"
+              "font-family:system-ui,-apple-system,sans-serif;color:#17222b}"
+              "main{max-width:620px;margin:auto;padding:22px}"
+              ".card{background:white;border-radius:16px;padding:20px;margin-bottom:16px;"
+              "box-shadow:0 7px 24px #17222b12}"
+              "h1{margin:0 0 8px}p{color:#65717b;line-height:1.45}"
+              "label{display:block;font-weight:700;margin:12px 0 6px}"
+              "input{width:100%;padding:12px;border:1px solid #ccd3d8;"
+              "border-radius:10px;font:inherit}"
+              "button{width:100%;padding:13px;margin-top:14px;border:0;border-radius:10px;"
+              "background:#167a62;color:white;font:inherit;font-weight:700}"
+              ".status{background:#edf7f4;padding:12px;border-radius:10px;"
+              "white-space:pre-wrap}.small{font-size:13px}"
+              "</style></head><body><main>"
+              "<div class='card'><h1>Bus Clock Display</h1>"
+              "<p>Home Wi-Fi setup, HKO weather and local OTA recovery.</p>"
+              "<div id='status' class='status'>Loading...</div></div>"
+              "<div class='card'><h2>Home Wi-Fi</h2>"
+              "<form method='post' action='/wifi'>"
+              "<label>Wi-Fi name (SSID)</label>"
+              "<input name='ssid' maxlength='32' required>"
+              "<label>Password</label>"
+              "<input name='password' type='password' maxlength='64'>"
+              "<button type='submit'>Save and restart</button></form>"
+              "<p class='small'>The ESP32-Display-OTA hotspot remains available.</p></div>"
+              "<div class='card'><h2>Local OTA recovery</h2>"
+              "<p class='small'>Upload an OTA APP .bin only. Never upload FULL.bin.</p>"
+              "<input id='fw' type='file' accept='.bin'>"
+              "<button onclick='uploadFirmware()'>Upload and restart</button>"
+              "<div id='uploadStatus' class='small'></div></div>"
+              "</main><script>"
+              "async function refresh(){try{const r=await fetch('/api/status');"
+              "const j=await r.json();document.getElementById('status').textContent="
+              "`Home Wi-Fi: ${j.connected?'connected':'not connected'}\\n`+"
+              "`SSID: ${j.ssid||'-'}\\nIP: ${j.ip||'-'}\\n`+"
+              "`Clock: ${j.clock}\\nWeather: ${j.weather}`;}catch(e){"
+              "document.getElementById('status').textContent='Status unavailable';}}"
+              "async function uploadFirmware(){const f=document.getElementById('fw').files[0];"
+              "const s=document.getElementById('uploadStatus');"
+              "if(!f){s.textContent='Choose an OTA APP .bin first';return;}"
+              "if(!confirm('Upload '+f.name+'?'))return;"
+              "s.textContent='Uploading. Keep power connected...';"
+              "try{const r=await fetch('/update',{method:'POST',"
+              "headers:{'Content-Type':'application/octet-stream'},body:f});"
+              "s.textContent=await r.text()}catch(e){s.textContent='Device may be restarting.'}}"
+              "refresh();setInterval(refresh,5000);"
+              "</script></body></html>";
+
+          static uint32_t bg_color(void)
+          {
+              return dark_mode ? 0x080A0D : 0xEEF1F4;
+          }
+
+          static uint32_t card_color(void)
+          {
+              return dark_mode ? 0x151A20 : 0xFFFFFF;
+          }
+
+          static uint32_t primary_text(void)
+          {
+              return dark_mode ? 0xF6F7F8 : 0x17222B;
+          }
+
+          static uint32_t secondary_text(void)
+          {
+              return dark_mode ? 0xAEB8C2 : 0x65717B;
+          }
+
+          static void style_box(lv_obj_t *obj, uint32_t color, int radius)
+          {
+              lv_obj_set_style_bg_color(obj, lv_color_hex(color), 0);
+              lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
+              lv_obj_set_style_radius(obj, radius, 0);
+              lv_obj_set_style_border_width(obj, 0, 0);
+              lv_obj_set_style_pad_all(obj, 0, 0);
+              lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+          }
+
+          static lv_obj_t *make_label(
+              lv_obj_t *parent,
+              const char *text,
+              int x,
+              int y,
+              const lv_font_t *font,
+              uint32_t color)
+          {
+              lv_obj_t *label = lv_label_create(parent);
+              lv_label_set_text(label, text);
+              lv_obj_set_pos(label, x, y);
+              lv_obj_set_style_text_font(label, font, 0);
+              lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
+              return label;
+          }
+
+          static bool clock_is_valid(void)
+          {
+              return time(NULL) >= 1735689600;
+          }
+
+          static void format_eta(char *buffer, size_t size, int seconds)
+          {
+              if (seconds <= 30) {
+                  snprintf(buffer, size, "DUE");
+              } else {
+                  snprintf(buffer, size, "%d min", (seconds + 59) / 60);
+              }
+          }
+
+          static void update_eta_labels(void)
+          {
+              char text[24];
+
+              for (int i = 0; i < 3; ++i) {
+                  if (eta_labels[i] != NULL) {
+                      format_eta(text, sizeof(text), eta_seconds[i]);
+                      lv_label_set_text(eta_labels[i], text);
+                  }
+              }
+
+              if (updated_label != NULL) {
+                  snprintf(text, sizeof(text), "Updated %lus",
+                           (unsigned long)refresh_count);
+                  lv_label_set_text(updated_label, text);
+              }
+          }
+
+          static void refresh_clicked(lv_event_t *event)
+          {
+              (void)event;
+              eta_seconds[0] = 180;
+              eta_seconds[1] = 660;
+              eta_seconds[2] = 1440;
+              refresh_count = 0;
+              update_eta_labels();
+          }
+
+          static void create_display_ui(void);
+
+          static void theme_clicked(lv_event_t *event)
+          {
+              (void)event;
+              dark_mode = !dark_mode;
+              create_display_ui();
+          }
+
+          static void make_eta_row(
+              lv_obj_t *screen,
+              int y,
+              const char *sequence,
+              const char *note,
+              uint32_t accent,
+              int index)
+          {
+              lv_obj_t *card = lv_obj_create(screen);
+              lv_obj_set_pos(card, 20, y);
+              lv_obj_set_size(card, 760, 62);
+              style_box(card, card_color(), 12);
+
+              lv_obj_t *bar = lv_obj_create(card);
+              lv_obj_set_pos(bar, 0, 0);
+              lv_obj_set_size(bar, 8, 62);
+              style_box(bar, accent, 0);
+
+              make_label(card, sequence, 25, 7,
+                         &lv_font_montserrat_20, primary_text());
+              make_label(card, note, 25, 35,
+                         &lv_font_montserrat_14, secondary_text());
+
+              eta_labels[index] = make_label(
+                  card, "--", 602, 10,
+                  &lv_font_montserrat_32, accent);
+              lv_obj_set_width(eta_labels[index], 130);
+              lv_obj_set_style_text_align(
+                  eta_labels[index], LV_TEXT_ALIGN_RIGHT, 0);
+          }
+
+          static void create_display_ui(void)
+          {
+              lv_obj_t *screen = lv_screen_active();
+              lv_obj_clean(screen);
+              lv_obj_remove_style_all(screen);
+              lv_obj_set_style_bg_color(screen, lv_color_hex(bg_color()), 0);
+              lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+              lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+
+              lv_obj_t *header = lv_obj_create(screen);
+              lv_obj_set_pos(header, 0, 0);
+              lv_obj_set_size(header, 800, 112);
+              style_box(header, dark_mode ? 0x101419 : 0xC9152B, 0);
+
+              lv_obj_t *route = lv_obj_create(header);
+              lv_obj_set_pos(route, 18, 14);
+              lv_obj_set_size(route, 112, 48);
+              style_box(route, 0xFFD447, 10);
+
+              lv_obj_t *route_text = make_label(
+                  route, "962B", 0, 4,
+                  &lv_font_montserrat_36, 0x151515);
+              lv_obj_set_width(route_text, 112);
+              lv_obj_set_style_text_align(route_text, LV_TEXT_ALIGN_CENTER, 0);
+
+              date_label = make_label(
+                  header, "WAITING FOR TIME", 18, 76,
+                  &lv_font_montserrat_14, dark_mode ? 0xAEB8C2 : 0xFFE7EA);
+
+              clock_label = make_label(
+                  header, "--:--:--", 160, 8,
+                  &lv_font_montserrat_48, 0xFFFFFF);
+
+              millis_label = make_label(
+                  header, ".---", 420, 25,
+                  &lv_font_montserrat_28, 0xFFD447);
+
+              weather_label = make_label(
+                  header, weather_text, 500, 72,
+                  &lv_font_montserrat_14, dark_mode ? 0xAEB8C2 : 0xFFE7EA);
+              lv_obj_set_width(weather_label, 280);
+              lv_obj_set_style_text_align(weather_label, LV_TEXT_ALIGN_RIGHT, 0);
+
+              lv_obj_t *theme_button = lv_button_create(header);
+              lv_obj_set_pos(theme_button, 670, 13);
+              lv_obj_set_size(theme_button, 110, 44);
+              lv_obj_set_style_bg_color(
+                  theme_button, lv_color_hex(dark_mode ? 0xFFFFFF : 0x9F1022), 0);
+              lv_obj_set_style_radius(theme_button, 10, 0);
+              lv_obj_add_event_cb(
+                  theme_button, theme_clicked, LV_EVENT_CLICKED, NULL);
+
+              lv_obj_t *theme_text = lv_label_create(theme_button);
+              lv_label_set_text(theme_text, dark_mode ? "LIGHT" : "DARK");
+              lv_obj_set_style_text_font(theme_text, &lv_font_montserrat_14, 0);
+              lv_obj_set_style_text_color(
+                  theme_text, lv_color_hex(dark_mode ? 0x111111 : 0xFFFFFF), 0);
+              lv_obj_center(theme_text);
+
+              lv_obj_t *stop_card = lv_obj_create(screen);
+              lv_obj_set_pos(stop_card, 20, 122);
+              lv_obj_set_size(stop_card, 760, 58);
+              style_box(stop_card, dark_mode ? 0x232A32 : 0x17222B, 12);
+
+              make_label(stop_card, "STOP", 22, 9,
+                         &lv_font_montserrat_14, 0x94A1AA);
+              make_label(stop_card, "Tuen Mun Town Centre", 82, 4,
+                         &lv_font_montserrat_28, 0xFFFFFF);
+              make_label(stop_card, "Towards Causeway Bay", 472, 19,
+                         &lv_font_montserrat_14, 0xCBD2D8);
+
+              make_eta_row(screen, 190, "1st bus",
+                           "Low-floor service", 0x15916F, 0);
+              make_eta_row(screen, 258, "2nd bus",
+                           "Scheduled service", 0xD88400, 1);
+              make_eta_row(screen, 326, "3rd bus",
+                           "Scheduled service", 0x5163D8, 2);
+
+              lv_obj_t *refresh_button = lv_button_create(screen);
+              lv_obj_set_pos(refresh_button, 650, 398);
+              lv_obj_set_size(refresh_button, 130, 42);
+              lv_obj_set_style_bg_color(
+                  refresh_button, lv_color_hex(dark_mode ? 0x2A3540 : 0xC9152B), 0);
+              lv_obj_set_style_radius(refresh_button, 10, 0);
+              lv_obj_add_event_cb(
+                  refresh_button, refresh_clicked, LV_EVENT_CLICKED, NULL);
+
+              lv_obj_t *refresh_text = lv_label_create(refresh_button);
+              lv_label_set_text(refresh_text, "REFRESH");
+              lv_obj_set_style_text_font(refresh_text, &lv_font_montserrat_14, 0);
+              lv_obj_center(refresh_text);
+
+              lv_obj_t *footer = lv_obj_create(screen);
+              lv_obj_set_pos(footer, 0, 448);
+              lv_obj_set_size(footer, 800, 32);
+              style_box(footer, dark_mode ? 0x101419 : 0x17222B, 0);
+
+              updated_label = make_label(
+                  footer, "Updated 0s", 18, 8,
+                  &lv_font_montserrat_14, 0xFFFFFF);
+
+              wifi_label = make_label(
+                  footer, wifi_status_text, 220, 8,
+                  &lv_font_montserrat_14, 0xBFD0D7);
+              lv_obj_set_width(wifi_label, 560);
+              lv_obj_set_style_text_align(wifi_label, LV_TEXT_ALIGN_RIGHT, 0);
+
+              update_eta_labels();
+          }
+
+          static void eta_timer_cb(lv_timer_t *timer)
+          {
+              (void)timer;
+
+              for (int i = 0; i < 3; ++i) {
+                  eta_seconds[i]--;
+
+                  if (eta_seconds[i] < -30) {
+                      eta_seconds[0] = eta_seconds[1];
+                      eta_seconds[1] = eta_seconds[2];
+                      eta_seconds[2] = eta_seconds[1] + 780;
+                      break;
+                  }
+              }
+
+              refresh_count++;
+              update_eta_labels();
+          }
+
+          static void clock_timer_cb(lv_timer_t *timer)
+          {
+              (void)timer;
+
+              if (!clock_is_valid()) {
+                  if (clock_label != NULL) {
+                      lv_label_set_text(clock_label, "--:--:--");
+                  }
+                  if (millis_label != NULL) {
+                      lv_label_set_text(millis_label, ".---");
+                  }
+                  if (date_label != NULL) {
+                      lv_label_set_text(date_label, "WAITING FOR NTP");
+                  }
+                  return;
+              }
+
+              struct timeval now;
+              struct tm local_time;
+              char clock_buffer[16];
+              char millis_buffer[8];
+              char date_buffer[32];
+
+              gettimeofday(&now, NULL);
+              localtime_r(&now.tv_sec, &local_time);
+
+              strftime(clock_buffer, sizeof(clock_buffer), "%H:%M:%S", &local_time);
+              snprintf(millis_buffer, sizeof(millis_buffer),
+                       ".%03ld", now.tv_usec / 1000);
+              strftime(date_buffer, sizeof(date_buffer),
+                       "%a  %d %b %Y", &local_time);
+
+              if (clock_label != NULL) {
+                  lv_label_set_text(clock_label, clock_buffer);
+              }
+              if (millis_label != NULL) {
+                  lv_label_set_text(millis_label, millis_buffer);
+              }
+              if (date_label != NULL) {
+                  lv_label_set_text(date_label, date_buffer);
+              }
+          }
+
+          static esp_err_t initialise_nvs(void)
+          {
+              esp_err_t error = nvs_flash_init();
+
+              if (error == ESP_ERR_NVS_NO_FREE_PAGES ||
+                  error == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+                  ESP_ERROR_CHECK(nvs_flash_erase());
+                  error = nvs_flash_init();
+              }
+
+              return error;
+          }
+
+          static void load_wifi_credentials(void)
+          {
+              nvs_handle_t handle;
+              size_t ssid_length = sizeof(saved_ssid);
+              size_t password_length = sizeof(saved_password);
+
+              saved_ssid[0] = '\0';
+              saved_password[0] = '\0';
+
+              if (nvs_open("wifi_cfg", NVS_READONLY, &handle) != ESP_OK) {
+                  return;
+              }
+
+              if (nvs_get_str(handle, "ssid", saved_ssid, &ssid_length) != ESP_OK) {
+                  saved_ssid[0] = '\0';
+              }
+
+              if (nvs_get_str(
+                      handle, "password", saved_password, &password_length) != ESP_OK) {
+                  saved_password[0] = '\0';
+              }
+
+              nvs_close(handle);
+          }
+
+          static esp_err_t save_wifi_credentials(
+              const char *ssid,
+              const char *password)
+          {
+              nvs_handle_t handle;
+              esp_err_t error = nvs_open("wifi_cfg", NVS_READWRITE, &handle);
+
+              if (error != ESP_OK) {
+                  return error;
+              }
+
+              error = nvs_set_str(handle, "ssid", ssid);
+              if (error == ESP_OK) {
+                  error = nvs_set_str(handle, "password", password);
+              }
+              if (error == ESP_OK) {
+                  error = nvs_commit(handle);
+              }
+
+              nvs_close(handle);
+              return error;
+          }
+
+          static void set_wifi_status(const char *text)
+          {
+              strlcpy(wifi_status_text, text, sizeof(wifi_status_text));
+
+              if (wifi_label != NULL) {
+                  lv_lock();
+                  lv_label_set_text(wifi_label, wifi_status_text);
+                  lv_unlock();
+              }
+          }
+
+          static void set_weather_status(const char *text)
+          {
+              strlcpy(weather_text, text, sizeof(weather_text));
+
+              if (weather_label != NULL) {
+                  lv_lock();
+                  lv_label_set_text(weather_label, weather_text);
+                  lv_unlock();
+              }
+          }
+
+          static void wifi_event_handler(
+              void *arg,
+              esp_event_base_t event_base,
+              int32_t event_id,
+              void *event_data)
+          {
+              (void)arg;
+
+              if (event_base == WIFI_EVENT &&
+                  event_id == WIFI_EVENT_STA_START &&
+                  saved_ssid[0] != '\0') {
+                  esp_wifi_connect();
+                  return;
+              }
+
+              if (event_base == WIFI_EVENT &&
+                  event_id == WIFI_EVENT_STA_DISCONNECTED) {
+                  xEventGroupClearBits(wifi_events, WIFI_CONNECTED_BIT);
+
+                  if (saved_ssid[0] != '\0') {
+                      set_wifi_status("Wi-Fi: reconnecting...");
+                      esp_wifi_connect();
+                  }
+                  return;
+              }
+
+              if (event_base == IP_EVENT &&
+                  event_id == IP_EVENT_STA_GOT_IP) {
+                  ip_event_got_ip_t *event = event_data;
+                  char text[96];
+
+                  snprintf(text, sizeof(text),
+                           "Wi-Fi: %s  " IPSTR "  |  OTA 192.168.4.1",
+                           saved_ssid, IP2STR(&event->ip_info.ip));
+                  set_wifi_status(text);
+                  xEventGroupSetBits(wifi_events, WIFI_CONNECTED_BIT);
+              }
+          }
+
+          static void start_wifi(void)
+          {
+              wifi_events = xEventGroupCreate();
+              load_wifi_credentials();
+
+              ESP_ERROR_CHECK(esp_netif_init());
+              ESP_ERROR_CHECK(esp_event_loop_create_default());
+              esp_netif_create_default_wifi_ap();
+              esp_netif_create_default_wifi_sta();
+
+              wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
+              ESP_ERROR_CHECK(esp_wifi_init(&init_config));
+
+              ESP_ERROR_CHECK(esp_event_handler_register(
+                  WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL));
+              ESP_ERROR_CHECK(esp_event_handler_register(
+                  IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL));
+
+              wifi_config_t ap_config = {0};
+              strlcpy((char *)ap_config.ap.ssid, SETUP_AP_SSID,
+                      sizeof(ap_config.ap.ssid));
+              strlcpy((char *)ap_config.ap.password, SETUP_AP_PASS,
+                      sizeof(ap_config.ap.password));
+              ap_config.ap.ssid_len = strlen(SETUP_AP_SSID);
+              ap_config.ap.channel = 1;
+              ap_config.ap.max_connection = 4;
+              ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+              ap_config.ap.pmf_cfg.required = false;
+
+              ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+              ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+
+              if (saved_ssid[0] != '\0') {
+                  wifi_config_t sta_config = {0};
+                  strlcpy((char *)sta_config.sta.ssid, saved_ssid,
+                          sizeof(sta_config.sta.ssid));
+                  strlcpy((char *)sta_config.sta.password, saved_password,
+                          sizeof(sta_config.sta.password));
+                  sta_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+                  sta_config.sta.pmf_cfg.capable = true;
+                  sta_config.sta.pmf_cfg.required = false;
+
+                  ESP_ERROR_CHECK(
+                      esp_wifi_set_config(WIFI_IF_STA, &sta_config));
+              }
+
+              ESP_ERROR_CHECK(esp_wifi_start());
+          }
+
+          static bool url_decode(
+              char *destination,
+              size_t destination_size,
+              const char *source)
+          {
+              if (destination_size == 0) {
+                  return false;
+              }
+
+              size_t written = 0;
+
+              while (*source != '\0' && written + 1 < destination_size) {
+                  if (*source == '%' &&
+                      source[1] != '\0' &&
+                      source[2] != '\0') {
+                      char hex[3] = {source[1], source[2], '\0'};
+                      destination[written++] = (char)strtol(hex, NULL, 16);
+                      source += 3;
+                  } else if (*source == '+') {
+                      destination[written++] = ' ';
+                      source++;
+                  } else {
+                      destination[written++] = *source++;
+                  }
+              }
+
+              destination[written] = '\0';
+              return *source == '\0';
+          }
+
+          static esp_err_t index_get_handler(httpd_req_t *request)
+          {
+              httpd_resp_set_type(request, "text/html");
+              httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+              return httpd_resp_send(
+                  request, MANAGEMENT_PAGE, HTTPD_RESP_USE_STRLEN);
+          }
+
+          static esp_err_t status_get_handler(httpd_req_t *request)
+          {
+              bool connected =
+                  (xEventGroupGetBits(wifi_events) & WIFI_CONNECTED_BIT) != 0;
+              char ip_text[24] = "";
+
+              if (connected) {
+                  esp_netif_t *netif =
+                      esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+                  esp_netif_ip_info_t info;
+
+                  if (netif != NULL &&
+                      esp_netif_get_ip_info(netif, &info) == ESP_OK) {
+                      snprintf(ip_text, sizeof(ip_text), IPSTR,
+                               IP2STR(&info.ip));
+                  }
+              }
+
+              char response[512];
+              snprintf(
+                  response, sizeof(response),
+                  "{\"connected\":%s,\"ssid\":\"%s\",\"ip\":\"%s\","
+                  "\"clock\":\"%s\",\"weather\":\"%s\"}",
+                  connected ? "true" : "false",
+                  saved_ssid,
+                  ip_text,
+                  clock_is_valid() ? "NTP synchronized" : "waiting for NTP",
+                  weather_text);
+
+              httpd_resp_set_type(request, "application/json");
+              httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+              return httpd_resp_sendstr(request, response);
+          }
+
+          static esp_err_t wifi_post_handler(httpd_req_t *request)
+          {
+              if (request->content_len <= 0 ||
+                  request->content_len > 512) {
+                  httpd_resp_send_err(
+                      request, HTTPD_400_BAD_REQUEST, "Invalid form data");
+                  return ESP_FAIL;
+              }
+
+              char *body = calloc(1, request->content_len + 1);
+              if (body == NULL) {
+                  httpd_resp_send_err(
+                      request, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+                  return ESP_FAIL;
+              }
+
+              int received = httpd_req_recv(
+                  request, body, request->content_len);
+              if (received <= 0) {
+                  free(body);
+                  httpd_resp_send_err(
+                      request, HTTPD_400_BAD_REQUEST, "Form receive failed");
+                  return ESP_FAIL;
+              }
+
+              char encoded_ssid[100] = "";
+              char encoded_password[180] = "";
+              char decoded_ssid[33] = "";
+              char decoded_password[65] = "";
+
+              esp_err_t ssid_result = httpd_query_key_value(
+                  body, "ssid", encoded_ssid, sizeof(encoded_ssid));
+              esp_err_t password_result = httpd_query_key_value(
+                  body, "password",
+                  encoded_password, sizeof(encoded_password));
+              free(body);
+
+              if (ssid_result != ESP_OK ||
+                  !url_decode(decoded_ssid, sizeof(decoded_ssid), encoded_ssid)) {
+                  httpd_resp_send_err(
+                      request, HTTPD_400_BAD_REQUEST, "Invalid SSID");
+                  return ESP_FAIL;
+              }
+
+              if (password_result == ESP_OK &&
+                  !url_decode(decoded_password,
+                              sizeof(decoded_password),
+                              encoded_password)) {
+                  httpd_resp_send_err(
+                      request, HTTPD_400_BAD_REQUEST, "Invalid password");
+                  return ESP_FAIL;
+              }
+
+              if (decoded_ssid[0] == '\0' ||
+                  save_wifi_credentials(decoded_ssid, decoded_password) != ESP_OK) {
+                  httpd_resp_send_err(
+                      request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                      "Could not save Wi-Fi details");
+                  return ESP_FAIL;
+              }
+
+              httpd_resp_set_type(request, "text/plain");
+              httpd_resp_sendstr(
+                  request, "Wi-Fi saved. The display is restarting.");
+              vTaskDelay(pdMS_TO_TICKS(1000));
+              esp_restart();
+              return ESP_OK;
+          }
+
+          static esp_err_t local_ota_post_handler(httpd_req_t *request)
+          {
+              if (request->content_len <= 0) {
+                  httpd_resp_send_err(
+                      request, HTTPD_400_BAD_REQUEST, "Empty upload");
+                  return ESP_FAIL;
+              }
+
+              const esp_partition_t *partition =
+                  esp_ota_get_next_update_partition(NULL);
+              if (partition == NULL) {
+                  httpd_resp_send_err(
+                      request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                      "No OTA partition");
+                  return ESP_FAIL;
+              }
+
+              esp_ota_handle_t ota_handle;
+              esp_err_t error =
+                  esp_ota_begin(partition, request->content_len, &ota_handle);
+
+              if (error != ESP_OK) {
+                  httpd_resp_send_err(
+                      request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                      "OTA start failed");
+                  return ESP_FAIL;
+              }
+
+              char *buffer = malloc(LOCAL_OTA_BUFFER);
+              if (buffer == NULL) {
+                  esp_ota_abort(ota_handle);
+                  httpd_resp_send_err(
+                      request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                      "Out of memory");
+                  return ESP_FAIL;
+              }
+
+              int remaining = request->content_len;
+
+              while (remaining > 0) {
+                  int wanted =
+                      remaining > LOCAL_OTA_BUFFER ?
+                      LOCAL_OTA_BUFFER : remaining;
+                  int count = httpd_req_recv(request, buffer, wanted);
+
+                  if (count == HTTPD_SOCK_ERR_TIMEOUT) {
+                      continue;
+                  }
+
+                  if (count <= 0 ||
+                      esp_ota_write(ota_handle, buffer, count) != ESP_OK) {
+                      free(buffer);
+                      esp_ota_abort(ota_handle);
+                      httpd_resp_send_err(
+                          request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                          "OTA upload failed");
+                      return ESP_FAIL;
+                  }
+
+                  remaining -= count;
+              }
+
+              free(buffer);
+
+              error = esp_ota_end(ota_handle);
+
+              if (error != ESP_OK ||
+                  esp_ota_set_boot_partition(partition) != ESP_OK) {
+                  httpd_resp_send_err(
+                      request, HTTPD_400_BAD_REQUEST,
+                      "Invalid OTA APP firmware");
+                  return ESP_FAIL;
+              }
+
+              httpd_resp_set_type(request, "text/plain");
+              httpd_resp_sendstr(
+                  request, "Update successful. The display is restarting.");
+              vTaskDelay(pdMS_TO_TICKS(1000));
+              esp_restart();
+              return ESP_OK;
+          }
+
+          static void start_web_server(void)
+          {
+              httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+              config.stack_size = 8192;
+              config.recv_wait_timeout = 60;
+              config.send_wait_timeout = 60;
+              config.max_uri_handlers = 6;
+
+              ESP_ERROR_CHECK(httpd_start(&web_server, &config));
+
+              const httpd_uri_t routes[] = {
+                  {
+                      .uri = "/",
+                      .method = HTTP_GET,
+                      .handler = index_get_handler,
+                  },
+                  {
+                      .uri = "/api/status",
+                      .method = HTTP_GET,
+                      .handler = status_get_handler,
+                  },
+                  {
+                      .uri = "/wifi",
+                      .method = HTTP_POST,
+                      .handler = wifi_post_handler,
+                  },
+                  {
+                      .uri = "/update",
+                      .method = HTTP_POST,
+                      .handler = local_ota_post_handler,
+                  },
+              };
+
+              for (size_t i = 0;
+                   i < sizeof(routes) / sizeof(routes[0]);
+                   ++i) {
+                  ESP_ERROR_CHECK(
+                      httpd_register_uri_handler(web_server, &routes[i]));
+              }
+          }
+
+          static esp_err_t ensure_sntp_time(void)
+          {
+              if (clock_is_valid()) {
+                  return ESP_OK;
+              }
+
+              if (!sntp_started) {
+                  esp_sntp_config_t config =
+                      ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+                  esp_err_t error = esp_netif_sntp_init(&config);
+
+                  if (error != ESP_OK &&
+                      error != ESP_ERR_INVALID_STATE) {
+                      return error;
+                  }
+
+                  sntp_started = true;
+              }
+
+              return esp_netif_sntp_sync_wait(pdMS_TO_TICKS(15000));
+          }
+
+          static esp_err_t fetch_weather(void)
+          {
+              esp_http_client_config_t config = {
+                  .url = WEATHER_URL,
+                  .crt_bundle_attach = esp_crt_bundle_attach,
+                  .timeout_ms = 12000,
+                  .buffer_size = 4096,
+                  .buffer_size_tx = 1024,
+              };
+
+              esp_http_client_handle_t client =
+                  esp_http_client_init(&config);
+
+              if (client == NULL) {
+                  return ESP_ERR_NO_MEM;
+              }
+
+              esp_err_t error = esp_http_client_open(client, 0);
+              if (error != ESP_OK) {
+                  esp_http_client_cleanup(client);
+                  return error;
+              }
+
+              int64_t content_length =
+                  esp_http_client_fetch_headers(client);
+              (void)content_length;
+
+              char *payload = calloc(1, WEATHER_BUFFER_SIZE);
+              if (payload == NULL) {
+                  esp_http_client_close(client);
+                  esp_http_client_cleanup(client);
+                  return ESP_ERR_NO_MEM;
+              }
+
+              int total = 0;
+
+              while (total < WEATHER_BUFFER_SIZE - 1) {
+                  int count = esp_http_client_read(
+                      client,
+                      payload + total,
+                      WEATHER_BUFFER_SIZE - 1 - total);
+
+                  if (count < 0) {
+                      error = ESP_FAIL;
+                      break;
+                  }
+
+                  if (count == 0) {
+                      break;
+                  }
+
+                  total += count;
+              }
+
+              payload[total] = '\0';
+              int status_code = esp_http_client_get_status_code(client);
+              esp_http_client_close(client);
+              esp_http_client_cleanup(client);
+
+              if (error != ESP_OK ||
+                  status_code != 200 ||
+                  total == 0) {
+                  free(payload);
+                  return ESP_FAIL;
+              }
+
+              cJSON *root = cJSON_Parse(payload);
+              free(payload);
+
+              if (root == NULL) {
+                  return ESP_FAIL;
+              }
+
+              int temperature = -100;
+              int humidity = -1;
+
+              cJSON *temperature_object =
+                  cJSON_GetObjectItemCaseSensitive(root, "temperature");
+              cJSON *temperature_data =
+                  cJSON_GetObjectItemCaseSensitive(
+                      temperature_object, "data");
+
+              cJSON *entry = NULL;
+              cJSON_ArrayForEach(entry, temperature_data) {
+                  cJSON *place =
+                      cJSON_GetObjectItemCaseSensitive(entry, "place");
+                  cJSON *value =
+                      cJSON_GetObjectItemCaseSensitive(entry, "value");
+
+                  if (cJSON_IsString(place) &&
+                      cJSON_IsNumber(value) &&
+                      strcmp(place->valuestring, "Tuen Mun") == 0) {
+                      temperature = value->valueint;
+                      break;
+                  }
+              }
+
+              cJSON *humidity_object =
+                  cJSON_GetObjectItemCaseSensitive(root, "humidity");
+              cJSON *humidity_data =
+                  cJSON_GetObjectItemCaseSensitive(
+                      humidity_object, "data");
+              cJSON *humidity_entry =
+                  cJSON_GetArrayItem(humidity_data, 0);
+
+              if (humidity_entry != NULL) {
+                  cJSON *humidity_value =
+                      cJSON_GetObjectItemCaseSensitive(
+                          humidity_entry, "value");
+
+                  if (cJSON_IsNumber(humidity_value)) {
+                      humidity = humidity_value->valueint;
+                  }
+              }
+
+              cJSON_Delete(root);
+
+              if (temperature < -50) {
+                  return ESP_FAIL;
+              }
+
+              char summary[96];
+
+              if (humidity >= 0) {
+                  snprintf(summary, sizeof(summary),
+                           "HKO TUEN MUN  %d C  |  HUMIDITY %d%%",
+                           temperature, humidity);
+              } else {
+                  snprintf(summary, sizeof(summary),
+                           "HKO TUEN MUN  %d C",
+                           temperature);
+              }
+
+              set_weather_status(summary);
+              return ESP_OK;
+          }
+
+          static void network_data_task(void *argument)
+          {
+              (void)argument;
+
+              for (;;) {
+                  xEventGroupWaitBits(
+                      wifi_events,
+                      WIFI_CONNECTED_BIT,
+                      pdFALSE,
+                      pdTRUE,
+                      portMAX_DELAY);
+
+                  set_weather_status("SYNCING HONG KONG TIME...");
+
+                  if (ensure_sntp_time() != ESP_OK) {
+                      set_weather_status("TIME SYNC FAILED - RETRYING");
+                      vTaskDelay(pdMS_TO_TICKS(30000));
+                      continue;
+                  }
+
+                  set_weather_status("UPDATING HKO WEATHER...");
+
+                  if (fetch_weather() != ESP_OK) {
+                      set_weather_status("HKO WEATHER UNAVAILABLE");
+                  }
+
+                  vTaskDelay(pdMS_TO_TICKS(15 * 60 * 1000));
+              }
+          }
+
+          void app_main(void)
+          {
+              ESP_ERROR_CHECK(initialise_nvs());
+
+              setenv("TZ", "HKT-8", 1);
+              tzset();
+
+              sunton_esp32s3_backlight_init();
+              lv_display_t *display = sunton_esp32s3_lcd_init();
+              (void)display;
+
+              i2c_master_bus_handle_t i2c_master =
+                  sunton_esp32s3_i2c_master();
+              sunton_esp32s3_touch_init(i2c_master);
+
+              lv_lock();
+              create_display_ui();
+              lv_timer_create(clock_timer_cb, 20, NULL);
+              lv_timer_create(eta_timer_cb, 1000, NULL);
+              lv_unlock();
+
+              start_wifi();
+              start_web_server();
+
+              xTaskCreate(
+                  network_data_task,
+                  "network_data",
+                  8192,
+                  NULL,
+                  5,
+                  NULL);
+          }
+          MAIN_C
+
+          cat > project/main/CMakeLists.txt <<'CMAKE'
+          idf_component_register(
+              SRCS "main.c" "sunton_esp32_8048s050c.c"
+              INCLUDE_DIRS "."
+              REQUIRES
+                  lvgl
+                  esp_lcd
+                  esp_lcd_touch_gt911
+                  esp_timer
+                  nvs_flash
+                  esp_wifi
+                  esp_netif
+                  esp_event
+                  esp_http_server
+                  esp_http_client
+                  app_update
+                  json
+                  mbedtls
+                  lwip
+          )
+          CMAKE
+
+          cat > project/partitions_ota.csv <<'PARTITIONS'
+          # Name,    Type, SubType, Offset,   Size,     Flags
+          nvs,       data, nvs,     0x9000,   0x4000,
+          otadata,   data, ota,     0xd000,   0x2000,
+          phy_init,  data, phy,     0xf000,   0x1000,
+          factory,   app,  factory, 0x10000,  0x400000,
+          ota_0,     app,  ota_0,   0x410000, 0x400000,
+          ota_1,     app,  ota_1,   0x810000, 0x400000,
+          storage,   data, spiffs,  0xc10000, 0x3f0000,
+          PARTITIONS
+
+          sed -i '/CONFIG_PARTITION_TABLE_/d' project/sdkconfig.defaults
+          cat >> project/sdkconfig.defaults <<'SDK'
+          CONFIG_PARTITION_TABLE_CUSTOM=y
+          CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_ota.csv"
+          CONFIG_PARTITION_TABLE_FILENAME="partitions_ota.csv"
+
+          CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+          CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+
+          CONFIG_LV_FONT_MONTSERRAT_14=y
+          CONFIG_LV_FONT_MONTSERRAT_20=y
+          CONFIG_LV_FONT_MONTSERRAT_28=y
+          CONFIG_LV_FONT_MONTSERRAT_32=y
+          CONFIG_LV_FONT_MONTSERRAT_36=y
+          CONFIG_LV_FONT_MONTSERRAT_48=y
+          SDK
+
+      - name: Build firmware
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE/project:/project" \
+            -w /project \
+            espressif/idf:v5.5.2 \
+            bash -lc '
+              set -e
+              . /opt/esp/idf/export.sh
+              idf.py set-target esp32s3
+              idf.py build
+              idf.py merge-bin -f raw
+
+              cp build/merged-binary.bin \
+                 /project/STEP2-CLOCK-WEATHER-FULL.bin
+              cp build/ESP32-8048S050C.bin \
+                 /project/STEP2-CLOCK-WEATHER-OTA-APP.bin
+
+              cat > /project/README.txt <<EOF
+          STEP 2 FEATURES
+          - Hong Kong date and weekday
+          - HH:MM:SS.mmm clock display
+          - HKO Tuen Mun temperature and humidity
+          - Touch light/dark mode
+          - Home Wi-Fi setup stored in NVS
+          - Existing local OTA recovery
+          - NO cloud firmware auto-update
+
+          INSTALL
+          1. Connect to ESP32-Display-OTA
+          2. Password: esp32ota88
+          3. Open http://192.168.4.1
+          4. Upload STEP2-CLOCK-WEATHER-OTA-APP.bin only
+          5. Reconnect to the setup page and save home Wi-Fi
+          EOF
+
+              ls -lh /project/STEP2-CLOCK-WEATHER-*.bin
+            '
+
+      - name: Upload firmware package
+        uses: actions/upload-artifact@v4
+        with:
+          name: STEP2-Clock-Weather-Theme
+          path: |
+            project/STEP2-CLOCK-WEATHER-OTA-APP.bin
+            project/STEP2-CLOCK-WEATHER-FULL.bin
+            project/README.txt
+          if-no-files-found: error
