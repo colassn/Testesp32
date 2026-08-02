@@ -1,0 +1,2938 @@
+name: STEP 6 - 香港全中文天氣時鐘
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Clone proven display project
+        run: git clone --depth 1 https://github.com/mr-sven/esp32-8048S050C.git project
+
+      - name: Install Hong Kong Chinese fonts
+        shell: bash
+        run: |
+          set -e
+          export NODE_OPTIONS=--max-old-space-size=8192
+          curl -L --fail --retry 3 -o NotoSansCJKhk-Regular.otf             https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/TraditionalChineseHK/NotoSansCJKhk-Regular.otf
+          npx --yes lv_font_conv@1.5.3 --font NotoSansCJKhk-Regular.otf             -r "0x20-0x7E,0x2E80-0x2EFF,0x2F00-0x2FDF,0x3000-0x303F,0x31C0-0x31EF,0x3400-0x4DBF,0x4E00-0x9FFF,0xF900-0xFAFF,0xFE30-0xFE4F,0xFF00-0xFFEF"             --size 18 --format lvgl --bpp 1 --no-kerning --no-compress -o project/main/hk_cjk_18.c
+          printf '%s' '一中九乾京今仙低來個備元光全兩公冷出分勢去可台啟園地坑城埔埗塘士多大天家密寒將對小屯山嶺已度後微德打文料新日時晴暫暴更朗期未本柏柱校毫氣水沙洲流浮涼深淺清測港準潮澳濕灣炎煙熱燥田相督短竹等筲箕米絡網緊線美而聽色荃落薄衣西觀角谷貢資赤跑軍連過道部酷量鐘長門間陽險雨雲雷霞霧青預頗風香馬驟高鱲黃點鼓龍' > font_ui_symbols.txt
+          npx --yes lv_font_conv@1.5.3 --font NotoSansCJKhk-Regular.otf             -r "0x20-0x7E,0x00B0,0x2013,0x30FB"             --symbols "$(cat font_ui_symbols.txt)"             --size 26 --format lvgl --bpp 2 --no-kerning --no-compress -o project/main/hk_ui_26.c
+          npx --yes lv_font_conv@1.5.3 --font NotoSansCJKhk-Regular.otf             --symbols "0123456789:" --size 72 --format lvgl --bpp 2 --no-kerning --no-compress -o project/main/hk_digits_72.c
+          npx --yes lv_font_conv@1.5.3 --font NotoSansCJKhk-Regular.otf             --symbols "0123456789.-–°C%" --size 56 --format lvgl --bpp 2 --no-kerning --no-compress -o project/main/hk_temp_56.c
+
+      - name: Add Chinese dashboard firmware
+        shell: bash
+        run: |
+          cat > project/main/main.c <<'MAIN_C'
+
+          #include <stdbool.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <strings.h>
+          #include <sys/time.h>
+          #include <time.h>
+          #include <ctype.h>
+          #include <unistd.h>
+          #include <math.h>
+
+          #include "freertos/FreeRTOS.h"
+          #include "freertos/event_groups.h"
+          #include "freertos/task.h"
+
+          #include "driver/i2c_master.h"
+          #include "esp_event.h"
+          #include "esp_http_server.h"
+          #include "esp_http_client.h"
+          #include "esp_crt_bundle.h"
+          #include "cJSON.h"
+          #include "esp_netif.h"
+          #include "esp_netif_sntp.h"
+          #include "esp_ota_ops.h"
+          #include "esp_spiffs.h"
+          #include "esp_system.h"
+          #include "esp_timer.h"
+          #include "esp_wifi.h"
+          #include "nvs.h"
+          #include "nvs_flash.h"
+
+          #include "lvgl.h"
+          #include "sunton_esp32_8048s050c.h"
+
+          LV_FONT_DECLARE(hk_cjk_18);
+          LV_FONT_DECLARE(hk_ui_26);
+          LV_FONT_DECLARE(hk_digits_72);
+          LV_FONT_DECLARE(hk_temp_56);
+
+          #define SETUP_AP_SSID "ESP32-Display-OTA"
+          #define SETUP_AP_PASS "esp32ota88"
+          #define WIFI_CONNECTED_BIT BIT0
+          #define LOCAL_OTA_BUFFER 4096
+          #define DISPLAY_HTML_MAX 16384
+          #define DISPLAY_HTML_PATH "/spiffs/display.html"
+          #define DISPLAY_HTML_TEMP_PATH "/spiffs/display.tmp"
+          #define HKO_CURRENT_URL "https://data.weather.gov.hk/weatherAPI/opendata/weather.php?dataType=rhrread&lang=tc"
+          #define HKO_FORECAST_URL "https://data.weather.gov.hk/weatherAPI/opendata/weather.php?dataType=fnd&lang=tc"
+          #define HKO_LOCAL_FORECAST_URL "https://data.weather.gov.hk/weatherAPI/opendata/weather.php?dataType=flw&lang=tc"
+          #define HKO_HOURLY_RAIN_URL "https://data.weather.gov.hk/weatherAPI/opendata/hourlyRainfall.php?lang=tc"
+          #define HKO_NOWCAST_URL "https://data.weather.gov.hk/weatherAPI/hko_data/F3/Gridded_rainfall_nowcast.csv"
+          #define HKO_HTTP_MAX 65536
+          #define HKO_REFRESH_MS (12 * 60 * 1000)
+          #define NOWCAST_SLOT_COUNT 4
+
+          static const char DEFAULT_DISPLAY_HTML[] =
+              "<!doctype html>\n"
+              "<html lang=\"zh-Hant-HK\">\n"
+              "<head>\n"
+              "  <meta charset=\"utf-8\">\n"
+              "  <meta name=\"viewport\" content=\"width=800,height=480,initial-scale=1\">\n"
+              "  <title>香港天氣時間</title>\n"
+              "</head>\n"
+              "<body data-light-bg=\"#EAF0F4\" data-dark-bg=\"#070A0D\">\n"
+              "  <div data-widget=\"panel\" data-light-bg=\"#F9FBFC\" data-dark-bg=\"#10151A\"\n"
+              "       style=\"left:10px;top:8px;width:780px;height:464px;border-radius:30px;\"></div>\n"
+              "\n"
+              "  <div data-widget=\"title\" data-font=\"ui\"\n"
+              "       data-light-color=\"#15222C\" data-dark-color=\"#F2F6F8\"\n"
+              "       style=\"left:30px;top:22px;width:330px;height:34px;font-size:26px;text-align:left;\">\n"
+              "    香港天氣・時間\n"
+              "  </div>\n"
+              "\n"
+              "  <div data-widget=\"date\" data-font=\"cjk\"\n"
+              "       data-light-color=\"#667782\" data-dark-color=\"#A9B7C0\"\n"
+              "       style=\"left:30px;top:56px;width:410px;height:26px;font-size:18px;text-align:left;\">\n"
+              "    {{date}}\n"
+              "  </div>\n"
+              "\n"
+              "  <button data-action=\"toggle-theme\" data-font=\"ui\"\n"
+              "          data-light-bg=\"#182630\" data-dark-bg=\"#EEF4F7\"\n"
+              "          data-light-color=\"#FFFFFF\" data-dark-color=\"#15222C\"\n"
+              "          style=\"left:646px;top:22px;width:122px;height:42px;border-radius:21px;font-size:20px;text-align:center;\">\n"
+              "    深色 / 淺色\n"
+              "  </button>\n"
+              "\n"
+              "  <div data-widget=\"clock\" data-font=\"digits\"\n"
+              "       data-light-color=\"#081118\" data-dark-color=\"#FFFFFF\"\n"
+              "       style=\"left:20px;top:76px;width:760px;height:82px;font-size:72px;text-align:center;\">\n"
+              "    {{time}}\n"
+              "  </div>\n"
+              "\n"
+              "  <div data-widget=\"card-current\" data-light-bg=\"#DCECF5\" data-dark-bg=\"#182934\"\n"
+              "       style=\"left:24px;top:166px;width:360px;height:180px;border-radius:24px;\"></div>\n"
+              "  <div data-widget=\"card-nowcast\" data-light-bg=\"#E7E2F6\" data-dark-bg=\"#28223B\"\n"
+              "       style=\"left:400px;top:166px;width:376px;height:180px;border-radius:24px;\"></div>\n"
+              "  <div data-widget=\"card-tomorrow\" data-light-bg=\"#EEF1F4\" data-dark-bg=\"#192026\"\n"
+              "       style=\"left:24px;top:360px;width:368px;height:78px;border-radius:20px;\"></div>\n"
+              "  <div data-widget=\"card-dayafter\" data-light-bg=\"#EEF1F4\" data-dark-bg=\"#192026\"\n"
+              "       style=\"left:408px;top:360px;width:368px;height:78px;border-radius:20px;\"></div>\n"
+              "\n"
+              "  <div data-widget=\"location\" data-font=\"ui\"\n"
+              "       data-light-color=\"#18384A\" data-dark-color=\"#D8F0FC\"\n"
+              "       style=\"left:42px;top:184px;width:310px;height:32px;font-size:26px;text-align:left;\">\n"
+              "    {{location}}\n"
+              "  </div>\n"
+              "\n"
+              "  <div data-widget=\"current-temp\" data-font=\"temp\"\n"
+              "       data-light-color=\"#071219\" data-dark-color=\"#FFFFFF\"\n"
+              "       style=\"left:42px;top:218px;width:130px;height:62px;font-size:56px;text-align:left;\">\n"
+              "    {{current_temp}}\n"
+              "  </div>\n"
+              "\n"
+              "  <div data-widget=\"current-condition\" data-font=\"cjk\"\n"
+              "       data-light-color=\"#18384A\" data-dark-color=\"#D8F0FC\"\n"
+              "       style=\"left:168px;top:220px;width:190px;height:28px;font-size:18px;text-align:left;\">\n"
+              "    {{current_condition}}\n"
+              "  </div>\n"
+              "  <div data-widget=\"today-range\" data-font=\"cjk\"\n"
+              "       data-light-color=\"#415866\" data-dark-color=\"#B7CEDA\"\n"
+              "       style=\"left:168px;top:250px;width:190px;height:26px;font-size:18px;text-align:left;\">\n"
+              "    {{today_range}}\n"
+              "  </div>\n"
+              "  <div data-widget=\"humidity\" data-font=\"cjk\"\n"
+              "       data-light-color=\"#415866\" data-dark-color=\"#B7CEDA\"\n"
+              "       style=\"left:168px;top:278px;width:190px;height:26px;font-size:18px;text-align:left;\">\n"
+              "    {{humidity}}\n"
+              "  </div>\n"
+              "  <div data-widget=\"rainfall\" data-font=\"cjk\"\n"
+              "       data-light-color=\"#415866\" data-dark-color=\"#B7CEDA\"\n"
+              "       style=\"left:42px;top:303px;width:316px;height:23px;font-size:18px;text-align:left;\">\n"
+              "    {{rainfall}}\n"
+              "  </div>\n"
+              "  <div data-widget=\"sunrise\" data-font=\"cjk\"\n"
+              "       data-light-color=\"#415866\" data-dark-color=\"#B7CEDA\"\n"
+              "       style=\"left:42px;top:326px;width:316px;height:22px;font-size:18px;text-align:left;\">\n"
+              "    {{sunrise}}\n"
+              "  </div>\n"
+              "\n"
+              "  <div data-widget=\"nowcast-title\" data-font=\"ui\"\n"
+              "       data-light-color=\"#35285B\" data-dark-color=\"#EEE8FF\"\n"
+              "       style=\"left:420px;top:184px;width:330px;height:32px;font-size:26px;text-align:left;\">\n"
+              "    未來兩個鐘\n"
+              "  </div>\n"
+              "  <div data-widget=\"nowcast-summary\" data-font=\"cjk\"\n"
+              "       data-light-color=\"#3E3262\" data-dark-color=\"#E2DAFA\"\n"
+              "       style=\"left:420px;top:222px;width:330px;height:27px;font-size:18px;text-align:left;\">\n"
+              "    {{nowcast_summary}}\n"
+              "  </div>\n"
+              "  <div data-widget=\"nowcast-detail\" data-font=\"cjk\"\n"
+              "       data-light-color=\"#5B4E79\" data-dark-color=\"#C7BDE4\"\n"
+              "       style=\"left:420px;top:252px;width:330px;height:54px;font-size:18px;text-align:left;\">\n"
+              "    {{nowcast_detail}}\n"
+              "  </div>\n"
+              "  <div data-widget=\"alert\" data-font=\"cjk\" data-scroll=\"true\"\n"
+              "       data-light-color=\"#6B2850\" data-dark-color=\"#FFB8D5\"\n"
+              "       style=\"left:420px;top:313px;width:330px;height:25px;font-size:18px;text-align:left;\">\n"
+              "    {{alert}}\n"
+              "  </div>\n"
+              "\n"
+              "  <div data-widget=\"forecast-1\" data-font=\"cjk\"\n"
+              "       data-light-color=\"#20313B\" data-dark-color=\"#E4EBEF\"\n"
+              "       style=\"left:42px;top:372px;width:332px;height:58px;font-size:18px;text-align:left;\">\n"
+              "    {{forecast_1}}\n"
+              "  </div>\n"
+              "  <div data-widget=\"forecast-2\" data-font=\"cjk\"\n"
+              "       data-light-color=\"#20313B\" data-dark-color=\"#E4EBEF\"\n"
+              "       style=\"left:426px;top:372px;width:332px;height:58px;font-size:18px;text-align:left;\">\n"
+              "    {{forecast_2}}\n"
+              "  </div>\n"
+              "\n"
+              "  <div data-widget=\"weather-update\" data-font=\"cjk\"\n"
+              "       data-light-color=\"#7B8992\" data-dark-color=\"#91A0AA\"\n"
+              "       style=\"left:28px;top:445px;width:460px;height:20px;font-size:18px;text-align:left;\">\n"
+              "    {{weather_update}}\n"
+              "  </div>\n"
+              "  <div data-widget=\"wifi\" data-font=\"cjk\"\n"
+              "       data-light-color=\"#7B8992\" data-dark-color=\"#91A0AA\"\n"
+              "       style=\"left:490px;top:445px;width:282px;height:20px;font-size:18px;text-align:right;\">\n"
+              "    {{wifi}}\n"
+              "  </div>\n"
+              "</body>\n"
+              "</html>\n";
+
+          static const char MANAGEMENT_PAGE[] =
+              "<!doctype html>\n"
+              "<html lang=\"zh-Hant-HK\">\n"
+              "<head>\n"
+              "  <meta charset=\"utf-8\">\n"
+              "  <meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">\n"
+              "  <title>香港天氣時鐘設定</title>\n"
+              "  <style>\n"
+              "    :root{--ink:#f5f8fa;--muted:#a9bac5;--card:#13212bbd;--line:#ffffff18;--accent:#83d8ff;--accent2:#b9a6ff;--danger:#ff8a9a}\n"
+              "    *{box-sizing:border-box}\n"
+              "    html{background:#071016}\n"
+              "    body{margin:0;min-height:100vh;color:var(--ink);font-family:system-ui,-apple-system,\"PingFang HK\",\"Noto Sans TC\",sans-serif;background:radial-gradient(circle at 15% 0%,#173647 0,transparent 38%),radial-gradient(circle at 90% 8%,#2e2350 0,transparent 36%),linear-gradient(145deg,#071016,#0d171e 60%,#091117);overflow-x:hidden}\n"
+              "    body:before{content:\"\";position:fixed;inset:-30%;background:conic-gradient(from 90deg,#68d5ff0b,#b59cff10,#68d5ff0b);animation:drift 18s linear infinite;pointer-events:none}\n"
+              "    @keyframes drift{to{transform:rotate(360deg)}}\n"
+              "    @keyframes rise{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:none}}\n"
+              "    main{position:relative;max-width:920px;margin:auto;padding:22px 16px 70px}\n"
+              "    .hero{padding:24px 4px 16px;animation:rise .55s ease both}\n"
+              "    .eyebrow{font-size:13px;letter-spacing:.16em;color:var(--accent);font-weight:800}\n"
+              "    h1{font-size:clamp(32px,8vw,54px);margin:8px 0 6px;letter-spacing:-.04em}\n"
+              "    .lead{color:var(--muted);font-size:16px;line-height:1.65;margin:0;max-width:680px}\n"
+              "    .grid{display:grid;grid-template-columns:1.15fr .85fr;gap:14px}\n"
+              "    .card{position:relative;background:linear-gradient(145deg,#182a35d9,#101b23d9);border:1px solid var(--line);border-radius:24px;padding:20px;box-shadow:0 22px 70px #0006;backdrop-filter:blur(18px);animation:rise .6s ease both}\n"
+              "    .card:nth-child(2){animation-delay:.08s} .card:nth-child(3){animation-delay:.14s}\n"
+              "    .wide{grid-column:1/-1}\n"
+              "    h2{font-size:21px;margin:0 0 8px}\n"
+              "    p{color:var(--muted);line-height:1.6;margin:6px 0 14px}\n"
+              "    .status{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:16px}\n"
+              "    .chip{background:#ffffff0a;border:1px solid var(--line);padding:12px 14px;border-radius:16px}\n"
+              "    .chip b{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}\n"
+              "    .chip span{font-size:16px;font-weight:750;word-break:break-all}\n"
+              "    label{display:block;font-size:14px;font-weight:800;margin:14px 0 7px}\n"
+              "    select,input,textarea{width:100%;border:1px solid #ffffff24;background:#071219b8;color:#fff;border-radius:15px;padding:14px 15px;font:inherit;outline:none;transition:.2s}\n"
+              "    select:focus,input:focus,textarea:focus{border-color:#83d8ff88;box-shadow:0 0 0 4px #83d8ff14}\n"
+              "    button{appearance:none;border:0;border-radius:15px;padding:13px 17px;font:inherit;font-weight:850;color:#061017;background:linear-gradient(135deg,var(--accent),#c3ecff);box-shadow:0 10px 26px #43bce52a;cursor:pointer;transition:.18s transform,.18s filter}\n"
+              "    button:hover{filter:brightness(1.05)}button:active{transform:scale(.975)}\n"
+              "    button.secondary{color:#fff;background:#ffffff12;border:1px solid var(--line);box-shadow:none}\n"
+              "    button.danger{color:#fff;background:#7f2734}\n"
+              "    .row{display:flex;flex-wrap:wrap;gap:9px;margin-top:10px}\n"
+              "    .message{min-height:24px;margin-top:10px;color:#bfeaff;font-weight:700}\n"
+              "    details{margin-top:12px}\n"
+              "    summary{cursor:pointer;color:#d9e6ed;font-weight:800;padding:10px 0}\n"
+              "    textarea{height:340px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre}\n"
+              "    iframe{width:100%;height:280px;border:1px solid var(--line);border-radius:18px;background:white;margin-top:12px}\n"
+              "    .pulse{display:inline-block;width:9px;height:9px;border-radius:99px;background:#72efb1;box-shadow:0 0 0 0 #72efb180;animation:pulse 1.7s infinite;margin-right:8px}\n"
+              "    @keyframes pulse{70%{box-shadow:0 0 0 10px #72efb100}100%{box-shadow:0 0 0 0 #72efb100}}\n"
+              "    .note{font-size:13px}\n"
+              "    @media(max-width:720px){.grid{grid-template-columns:1fr}.wide{grid-column:auto}.status{grid-template-columns:1fr 1fr}}\n"
+              "  </style>\n"
+              "</head>\n"
+              "<body>\n"
+              "<main>\n"
+              "  <section class=\"hero\">\n"
+              "    <div class=\"eyebrow\"><span class=\"pulse\"></span>ESP32 香港天氣時鐘</div>\n"
+              "    <h1>一個網站，設定晒所有嘢。</h1>\n"
+              "    <p class=\"lead\">揀地區、更新香港天文台資料、設定屋企 Wi‑Fi，同埋做 OTA 更新。儲存地區之後，個 Mon 會即刻重新攞資料，唔使重啟。</p>\n"
+              "  </section>\n"
+              "\n"
+              "  <section class=\"grid\">\n"
+              "    <div class=\"card wide\">\n"
+              "      <h2>部機而家嘅狀態</h2>\n"
+              "      <div class=\"status\">\n"
+              "        <div class=\"chip\"><b>屋企 Wi‑Fi</b><span id=\"sWifi\">讀取中…</span></div>\n"
+              "        <div class=\"chip\"><b>IP 地址</b><span id=\"sIp\">—</span></div>\n"
+              "        <div class=\"chip\"><b>天氣地點</b><span id=\"sStation\">—</span></div>\n"
+              "        <div class=\"chip\"><b>時鐘同步</b><span id=\"sClock\">—</span></div>\n"
+              "      </div>\n"
+              "    </div>\n"
+              "\n"
+              "    <div class=\"card\">\n"
+              "      <h2>天氣地點</h2>\n"
+              "      <p>揀你最接近嘅香港天文台氣溫站。短臨雨量會用同一地點附近嘅網格預報。</p>\n"
+              "      <label for=\"weatherStation\">地區</label>\n"
+              "      <select id=\"weatherStation\"><option value=\"香港天文台\">香港天文台</option>\n"
+              "<option value=\"京士柏\">京士柏</option>\n"
+              "<option value=\"香港公園\">香港公園</option>\n"
+              "<option value=\"黃竹坑\">黃竹坑</option>\n"
+              "<option value=\"筲箕灣\">筲箕灣</option>\n"
+              "<option value=\"跑馬地\">跑馬地</option>\n"
+              "<option value=\"赤柱\">赤柱</option>\n"
+              "<option value=\"九龍城\">九龍城</option>\n"
+              "<option value=\"黃大仙\">黃大仙</option>\n"
+              "<option value=\"觀塘\">觀塘</option>\n"
+              "<option value=\"深水埗\">深水埗</option>\n"
+              "<option value=\"啟德跑道公園\">啟德跑道公園</option>\n"
+              "<option value=\"青衣\">青衣</option>\n"
+              "<option value=\"荃灣可觀\">荃灣可觀</option>\n"
+              "<option value=\"荃灣城門谷\">荃灣城門谷</option>\n"
+              "<option value=\"沙田\">沙田</option>\n"
+              "<option value=\"大埔\">大埔</option>\n"
+              "<option value=\"大美督\">大美督</option>\n"
+              "<option value=\"屯門\">屯門</option>\n"
+              "<option value=\"元朗公園\">元朗公園</option>\n"
+              "<option value=\"流浮山\">流浮山</option>\n"
+              "<option value=\"打鼓嶺\">打鼓嶺</option>\n"
+              "<option value=\"西貢\">西貢</option>\n"
+              "<option value=\"將軍澳\">將軍澳</option>\n"
+              "<option value=\"長洲\">長洲</option>\n"
+              "<option value=\"赤鱲角\">赤鱲角</option></select>\n"
+              "      <div class=\"row\">\n"
+              "        <button onclick=\"saveWeatherStation()\">儲存並即時更新</button>\n"
+              "        <button class=\"secondary\" onclick=\"refreshWeather()\">即刻重新整理</button>\n"
+              "      </div>\n"
+              "      <div id=\"weatherStatus\" class=\"message\"></div>\n"
+              "      <p class=\"note\">地區即時氣溫來自所選氣象站；每日最高、最低溫同未來預報屬全港預測。</p>\n"
+              "    </div>\n"
+              "\n"
+              "    <div class=\"card\">\n"
+              "      <h2>屋企 Wi‑Fi</h2>\n"
+              "      <p>只支援 2.4 GHz Wi‑Fi。儲存後部機會重新啟動。</p>\n"
+              "      <form method=\"post\" action=\"/wifi\">\n"
+              "        <label>Wi‑Fi 名稱</label><input name=\"ssid\" maxlength=\"32\" required placeholder=\"例如 HomeWiFi\">\n"
+              "        <label>密碼</label><input name=\"password\" type=\"password\" maxlength=\"64\" placeholder=\"Wi‑Fi 密碼\">\n"
+              "        <button type=\"submit\">儲存 Wi‑Fi 並重新啟動</button>\n"
+              "      </form>\n"
+              "    </div>\n"
+              "\n"
+              "    <div class=\"card wide\">\n"
+              "      <h2>韌體 OTA 更新</h2>\n"
+              "      <p>只揀檔名有 <b>OTA-APP.bin</b> 嗰個。FULL.bin 唔可以喺呢度上載。</p>\n"
+              "      <input id=\"fw\" type=\"file\" accept=\".bin\">\n"
+              "      <div class=\"row\"><button onclick=\"uploadFirmware()\">上載並重新啟動</button></div>\n"
+              "      <div id=\"uploadStatus\" class=\"message\"></div>\n"
+              "    </div>\n"
+              "\n"
+              "    <div class=\"card wide\">\n"
+              "      <details>\n"
+              "        <summary>進階：display.html 編輯器</summary>\n"
+              "        <p>正常唔使改。日後想微調位置、大小或顏色先至用。</p>\n"
+              "        <textarea id=\"editor\" spellcheck=\"false\"></textarea>\n"
+              "        <div class=\"row\">\n"
+              "          <button onclick=\"saveHtml()\">儲存並顯示</button>\n"
+              "          <button class=\"secondary\" onclick=\"previewHtml()\">手機預覽</button>\n"
+              "          <button class=\"secondary\" onclick=\"document.getElementById('file').click()\">載入 HTML</button>\n"
+              "          <button class=\"danger\" onclick=\"restoreDefault()\">還原預設畫面</button>\n"
+              "        </div>\n"
+              "        <input id=\"file\" type=\"file\" accept=\".html,text/html\" hidden onchange=\"loadFile(event)\">\n"
+              "        <div id=\"editorStatus\" class=\"message\"></div>\n"
+              "        <iframe id=\"preview\"></iframe>\n"
+              "      </details>\n"
+              "    </div>\n"
+              "  </section>\n"
+              "</main>\n"
+              "<script>\n"
+              "async function loadStatus(){try{const r=await fetch('/api/status',{cache:'no-store'});const j=await r.json();\n"
+              " document.getElementById('sWifi').textContent=j.connected?'已連線：'+(j.ssid||''):'未連線';\n"
+              " document.getElementById('sIp').textContent=j.ip||'—';document.getElementById('sStation').textContent=j.station||'—';\n"
+              " document.getElementById('sClock').textContent=j.clock==='NTP synchronized'?'已同步香港時間':'等緊網絡校時';\n"
+              " if(j.station)document.getElementById('weatherStation').value=j.station;\n"
+              "}catch(e){document.getElementById('sWifi').textContent='暫時讀取唔到';}}\n"
+              "async function saveWeatherStation(){const s=document.getElementById('weatherStatus');s.textContent='儲存緊，跟住會即刻更新天氣…';try{const body=new URLSearchParams({station:document.getElementById('weatherStation').value});const r=await fetch('/weather-location',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});s.textContent=await r.text();loadStatus();}catch(e){s.textContent='儲存失敗，請再試。';}}\n"
+              "async function refreshWeather(){const s=document.getElementById('weatherStatus');s.textContent='重新攞緊香港天文台資料…';try{const r=await fetch('/api/weather-refresh',{method:'POST'});s.textContent=await r.text();}catch(e){s.textContent='更新要求失敗。';}}\n"
+              "async function loadHtml(){try{const r=await fetch('/api/html',{cache:'no-store'});document.getElementById('editor').value=await r.text();previewHtml();}catch(e){}}\n"
+              "async function saveHtml(){const s=document.getElementById('editorStatus');s.textContent='儲存緊…';try{const r=await fetch('/api/html',{method:'POST',headers:{'Content-Type':'text/html; charset=utf-8'},body:document.getElementById('editor').value});s.textContent=await r.text();}catch(e){s.textContent='儲存失敗。';}}\n"
+              "async function restoreDefault(){if(!confirm('確定還原預設中文版畫面？'))return;const r=await fetch('/api/default',{method:'POST'});document.getElementById('editorStatus').textContent=await r.text();await loadHtml();}\n"
+              "function loadFile(e){const f=e.target.files[0];if(!f)return;const rd=new FileReader();rd.onload=()=>{document.getElementById('editor').value=rd.result;previewHtml();};rd.readAsText(f);}\n"
+              "function previewHtml(){document.getElementById('preview').srcdoc=document.getElementById('editor').value;}\n"
+              "async function uploadFirmware(){const f=document.getElementById('fw').files[0],s=document.getElementById('uploadStatus');if(!f){s.textContent='請先揀 OTA-APP.bin。';return;}if(f.name.toLowerCase().includes('full')){s.textContent='呢個似係 FULL.bin，唔可以用網頁 OTA。';return;}if(!confirm('上載 '+f.name+'？更新期間唔好拔電。'))return;s.textContent='上載緊，請保持供電…';try{const r=await fetch('/update',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:f});s.textContent=await r.text();}catch(e){s.textContent='部機可能已經重新啟動。';}}\n"
+              "loadStatus();loadHtml();setInterval(loadStatus,5000);\n"
+              "</script>\n"
+              "</body>\n"
+              "</html>";
+          typedef struct {
+              int x;
+              int y;
+              int width;
+              int height;
+              int font_size;
+              int radius;
+              lv_text_align_t align;
+              bool hidden;
+              uint32_t light_color;
+              uint32_t dark_color;
+              uint32_t light_bg;
+              uint32_t dark_bg;
+          } html_style_t;
+
+          static EventGroupHandle_t wifi_events;
+          static httpd_handle_t web_server;
+
+          static char saved_ssid[33];
+          static char saved_password[65];
+          static char wifi_status_text[128] = "Wi‑Fi：設定熱點已開啟";
+          static char sync_status_text[64] = "等緊網絡校時";
+          static char weather_station[48] = "香港天文台";
+          static char current_temp_text[24] = "--°C";
+          static char current_condition_text[96] = "等緊天文台資料";
+          static char today_range_text[96] = "本港預測 --至--°C";
+          static char humidity_text[48] = "相對濕度 --%";
+          static char rainfall_text[96] = "過去一小時雨量 -- 毫米";
+          static char sunrise_text[96] = "日出 --:--　日落 --:--";
+          static char nowcast_summary_text[128] = "未來兩個鐘雨勢：等緊資料";
+          static char nowcast_detail_text[192] = "30分鐘 --｜60分鐘 --\n90分鐘 --｜120分鐘 --";
+          static char alert_text[256] = "暫時未有特別天氣提示";
+          static char forecast_text[3][256] = {
+              "聽日：等緊預報",
+              "後日：等緊預報",
+              "本港展望：等緊資料",
+          };
+          static char weather_update_text[96] = "香港天文台資料：等緊 Wi‑Fi";
+          static bool dark_mode = false;
+          static bool theme_loaded_from_nvs = false;
+          static bool sntp_started = false;
+          static bool html_file_ready = false;
+          static TaskHandle_t weather_task_handle = NULL;
+
+          static lv_obj_t *clock_label;
+          static lv_obj_t *milliseconds_label;
+          static lv_obj_t *date_label;
+          static lv_obj_t *stopwatch_label;
+          static lv_obj_t *wifi_label;
+          static lv_obj_t *sync_label;
+          static lv_obj_t *weather_now_label;
+          static lv_obj_t *weather_desc_label;
+          static lv_obj_t *forecast_label[3];
+          static lv_obj_t *weather_update_label;
+          static lv_obj_t *location_label;
+          static lv_obj_t *current_temp_label;
+          static lv_obj_t *current_condition_label;
+          static lv_obj_t *today_range_label;
+          static lv_obj_t *humidity_label;
+          static lv_obj_t *rainfall_label;
+          static lv_obj_t *sunrise_label;
+          static lv_obj_t *nowcast_summary_label;
+          static lv_obj_t *nowcast_detail_label;
+          static lv_obj_t *alert_label;
+
+          typedef struct {
+              const char *name;
+              double latitude;
+              double longitude;
+              const char *rain_district;
+              const char *rain_station;
+          } weather_location_t;
+
+          static const weather_location_t WEATHER_LOCATIONS[] = {
+              {"香港天文台", 22.302, 114.174, "油尖旺", "香港天文台"},
+              {"京士柏", 22.312, 114.173, "油尖旺", "京士柏"},
+              {"香港公園", 22.278, 114.162, "中西區", "香港天文台"},
+              {"黃竹坑", 22.248, 114.174, "南區", "黃竹坑"},
+              {"筲箕灣", 22.282, 114.236, "東區", "筲箕灣"},
+              {"跑馬地", 22.271, 114.184, "灣仔", "跑馬地"},
+              {"赤柱", 22.214, 114.219, "南區", "赤柱"},
+              {"九龍城", 22.335, 114.184, "九龍城", "廣播道"},
+              {"黃大仙", 22.341, 114.205, "黃大仙", "新蒲崗"},
+              {"觀塘", 22.313, 114.225, "觀塘", "觀塘"},
+              {"深水埗", 22.336, 114.139, "深水埗", "深水埗"},
+              {"啟德跑道公園", 22.305, 114.217, "九龍城", "啟德"},
+              {"青衣", 22.350, 114.104, "葵青", "長青"},
+              {"荃灣可觀", 22.383, 114.108, "荃灣", "荃灣可觀"},
+              {"荃灣城門谷", 22.375, 114.126, "荃灣", "荃灣可觀"},
+              {"沙田", 22.401, 114.210, "沙田", "沙田"},
+              {"大埔", 22.446, 114.164, "大埔", "大埔墟"},
+              {"大美督", 22.475, 114.237, "大埔", "大美督"},
+              {"屯門", 22.391, 113.976, "屯門", "屯門"},
+              {"元朗公園", 22.443, 114.022, "元朗", "水邊圍"},
+              {"流浮山", 22.469, 113.983, "元朗", "流浮山"},
+              {"打鼓嶺", 22.528, 114.156, "北區", "打鼓嶺"},
+              {"西貢", 22.383, 114.273, "西貢", "西貢"},
+              {"將軍澳", 22.315, 114.255, "西貢", "將軍澳"},
+              {"長洲", 22.201, 114.026, "離島區", "長洲"},
+              {"赤鱲角", 22.309, 113.922, "離島區", "香港國際機場"},
+          };
+
+          static const weather_location_t *find_weather_location(const char *name)
+          {
+              if (name == NULL) return &WEATHER_LOCATIONS[0];
+              for (size_t i = 0; i < sizeof(WEATHER_LOCATIONS) / sizeof(WEATHER_LOCATIONS[0]); i++) {
+                  if (strcmp(name, WEATHER_LOCATIONS[i].name) == 0) return &WEATHER_LOCATIONS[i];
+              }
+              return &WEATHER_LOCATIONS[0];
+          }
+
+          static bool weather_station_is_valid(const char *station)
+          {
+              if (station == NULL || station[0] == '\0') return false;
+              for (size_t i = 0; i < sizeof(WEATHER_LOCATIONS) / sizeof(WEATHER_LOCATIONS[0]); i++) {
+                  if (strcmp(station, WEATHER_LOCATIONS[i].name) == 0) return true;
+              }
+              return false;
+          }
+
+          static bool stopwatch_running = false;
+          static int64_t stopwatch_accumulated_us = 0;
+          static int64_t stopwatch_started_us = 0;
+
+          static uint32_t parse_hex_color(const char *text, uint32_t fallback)
+          {
+              if (text == NULL || text[0] != '#' || strlen(text) < 7) {
+                  return fallback;
+              }
+
+              char value[7];
+              memcpy(value, text + 1, 6);
+              value[6] = '\0';
+              return (uint32_t)strtoul(value, NULL, 16);
+          }
+
+          static bool extract_attribute(
+              const char *element,
+              const char *name,
+              char *output,
+              size_t output_size)
+          {
+              if (element == NULL || output == NULL || output_size == 0) {
+                  return false;
+              }
+
+              const char *tag_end = strchr(element, '>');
+              if (tag_end == NULL) {
+                  return false;
+              }
+
+              const char *cursor = element;
+              size_t name_length = strlen(name);
+
+              while ((cursor = strstr(cursor, name)) != NULL && cursor < tag_end) {
+                  const char *after_name = cursor + name_length;
+
+                  while (after_name < tag_end &&
+                         (*after_name == ' ' || *after_name == '\t')) {
+                      after_name++;
+                  }
+
+                  if (after_name >= tag_end || *after_name != '=') {
+                      cursor += name_length;
+                      continue;
+                  }
+
+                  after_name++;
+                  while (after_name < tag_end &&
+                         (*after_name == ' ' || *after_name == '\t')) {
+                      after_name++;
+                  }
+
+                  if (after_name >= tag_end ||
+                      (*after_name != '"' && *after_name != '\'')) {
+                      return false;
+                  }
+
+                  char quote = *after_name++;
+                  const char *value_end = after_name;
+
+                  while (value_end < tag_end && *value_end != quote) {
+                      value_end++;
+                  }
+
+                  if (value_end >= tag_end) {
+                      return false;
+                  }
+
+                  size_t length = (size_t)(value_end - after_name);
+                  if (length >= output_size) {
+                      length = output_size - 1;
+                  }
+
+                  memcpy(output, after_name, length);
+                  output[length] = '\0';
+                  return true;
+              }
+
+              return false;
+          }
+
+          static const char *find_element(
+              const char *html,
+              const char *attribute,
+              const char *value)
+          {
+              char double_pattern[96];
+              char single_pattern[96];
+
+              snprintf(
+                  double_pattern,
+                  sizeof(double_pattern),
+                  "%s=\"%s\"",
+                  attribute,
+                  value);
+              snprintf(
+                  single_pattern,
+                  sizeof(single_pattern),
+                  "%s='%s'",
+                  attribute,
+                  value);
+
+              const char *marker = strstr(html, double_pattern);
+              if (marker == NULL) {
+                  marker = strstr(html, single_pattern);
+              }
+              if (marker == NULL) {
+                  return NULL;
+              }
+
+              const char *start = marker;
+              while (start > html && *start != '<') {
+                  start--;
+              }
+
+              return *start == '<' ? start : NULL;
+          }
+
+          static bool extract_inner_text(
+              const char *element,
+              char *output,
+              size_t output_size)
+          {
+              if (element == NULL || output_size == 0) {
+                  return false;
+              }
+
+              const char *start = strchr(element, '>');
+              if (start == NULL) {
+                  return false;
+              }
+              start++;
+
+              const char *end = strchr(start, '<');
+              if (end == NULL) {
+                  return false;
+              }
+
+              while (start < end &&
+                     (*start == ' ' || *start == '\t' ||
+                      *start == '\r' || *start == '\n')) {
+                  start++;
+              }
+              while (end > start &&
+                     (end[-1] == ' ' || end[-1] == '\t' ||
+                      end[-1] == '\r' || end[-1] == '\n')) {
+                  end--;
+              }
+
+              size_t length = (size_t)(end - start);
+              if (length >= output_size) {
+                  length = output_size - 1;
+              }
+
+              memcpy(output, start, length);
+              output[length] = '\0';
+              return true;
+          }
+
+          static bool extract_css_value(
+              const char *style,
+              const char *property,
+              char *output,
+              size_t output_size)
+          {
+              if (style == NULL || output_size == 0) {
+                  return false;
+              }
+
+              size_t property_length = strlen(property);
+              const char *cursor = style;
+
+              while ((cursor = strstr(cursor, property)) != NULL) {
+                  bool valid_start =
+                      cursor == style ||
+                      cursor[-1] == ';' ||
+                      cursor[-1] == ' ' ||
+                      cursor[-1] == '\t';
+
+                  const char *after = cursor + property_length;
+                  while (*after == ' ' || *after == '\t') {
+                      after++;
+                  }
+
+                  if (!valid_start || *after != ':') {
+                      cursor += property_length;
+                      continue;
+                  }
+
+                  after++;
+                  while (*after == ' ' || *after == '\t') {
+                      after++;
+                  }
+
+                  const char *end = strchr(after, ';');
+                  if (end == NULL) {
+                      end = after + strlen(after);
+                  }
+
+                  while (end > after &&
+                         (end[-1] == ' ' || end[-1] == '\t')) {
+                      end--;
+                  }
+
+                  size_t length = (size_t)(end - after);
+                  if (length >= output_size) {
+                      length = output_size - 1;
+                  }
+
+                  memcpy(output, after, length);
+                  output[length] = '\0';
+                  return true;
+              }
+
+              return false;
+          }
+
+          static int css_integer(
+              const char *style,
+              const char *property,
+              int fallback)
+          {
+              char value[32];
+
+              if (!extract_css_value(
+                      style, property, value, sizeof(value))) {
+                  return fallback;
+              }
+
+              return atoi(value);
+          }
+
+          static bool css_hidden(const char *style)
+          {
+              char value[32];
+
+              if (!extract_css_value(
+                      style, "display", value, sizeof(value))) {
+                  return false;
+              }
+
+              return strcasecmp(value, "none") == 0;
+          }
+
+          static lv_text_align_t css_alignment(
+              const char *style,
+              lv_text_align_t fallback)
+          {
+              char value[32];
+
+              if (!extract_css_value(
+                      style, "text-align", value, sizeof(value))) {
+                  return fallback;
+              }
+
+              if (strcasecmp(value, "center") == 0) {
+                  return LV_TEXT_ALIGN_CENTER;
+              }
+              if (strcasecmp(value, "right") == 0) {
+                  return LV_TEXT_ALIGN_RIGHT;
+              }
+              return LV_TEXT_ALIGN_LEFT;
+          }
+
+          static const lv_font_t *font_for_size(int size)
+          {
+              if (size >= 44) return &lv_font_montserrat_48;
+              if (size >= 34) return &lv_font_montserrat_36;
+              if (size >= 30) return &lv_font_montserrat_32;
+              if (size >= 24) return &lv_font_montserrat_28;
+              if (size >= 17) return &lv_font_montserrat_20;
+              return &lv_font_montserrat_14;
+          }
+
+          static bool contains_non_ascii(const char *text)
+          {
+              if (text == NULL) return false;
+              while (*text) {
+                  if ((unsigned char)*text >= 0x80) return true;
+                  text++;
+              }
+              return false;
+          }
+
+          static const lv_font_t *font_for_element(
+              const char *element,
+              const char *text,
+              int size)
+          {
+              char kind[24] = "";
+              if (element != NULL) {
+                  extract_attribute(element, "data-font", kind, sizeof(kind));
+              }
+              if (strcmp(kind, "digits") == 0) return &hk_digits_72;
+              if (strcmp(kind, "temp") == 0) return &hk_temp_56;
+              if (strcmp(kind, "ui") == 0) return &hk_ui_26;
+              if (strcmp(kind, "cjk") == 0 || contains_non_ascii(text)) return &hk_cjk_18;
+              return font_for_size(size);
+          }
+
+          static html_style_t read_style(
+              const char *element,
+              html_style_t defaults)
+          {
+              char style[512] = "";
+              char value[32];
+
+              if (element != NULL) {
+                  extract_attribute(
+                      element, "style", style, sizeof(style));
+
+                  defaults.x =
+                      css_integer(style, "left", defaults.x);
+                  defaults.y =
+                      css_integer(style, "top", defaults.y);
+                  defaults.width =
+                      css_integer(style, "width", defaults.width);
+                  defaults.height =
+                      css_integer(style, "height", defaults.height);
+                  defaults.font_size =
+                      css_integer(style, "font-size", defaults.font_size);
+                  defaults.radius =
+                      css_integer(style, "border-radius", defaults.radius);
+                  defaults.align =
+                      css_alignment(style, defaults.align);
+                  defaults.hidden = css_hidden(style);
+
+                  if (extract_attribute(
+                          element,
+                          "data-light-color",
+                          value,
+                          sizeof(value))) {
+                      defaults.light_color =
+                          parse_hex_color(value, defaults.light_color);
+                  }
+                  if (extract_attribute(
+                          element,
+                          "data-dark-color",
+                          value,
+                          sizeof(value))) {
+                      defaults.dark_color =
+                          parse_hex_color(value, defaults.dark_color);
+                  }
+                  if (extract_attribute(
+                          element,
+                          "data-light-bg",
+                          value,
+                          sizeof(value))) {
+                      defaults.light_bg =
+                          parse_hex_color(value, defaults.light_bg);
+                  }
+                  if (extract_attribute(
+                          element,
+                          "data-dark-bg",
+                          value,
+                          sizeof(value))) {
+                      defaults.dark_bg =
+                          parse_hex_color(value, defaults.dark_bg);
+                  }
+              }
+
+              return defaults;
+          }
+
+          static uint32_t active_text_color(const html_style_t *style)
+          {
+              return dark_mode ? style->dark_color : style->light_color;
+          }
+
+          static uint32_t active_bg_color(const html_style_t *style)
+          {
+              return dark_mode ? style->dark_bg : style->light_bg;
+          }
+
+          static void style_box(
+              lv_obj_t *object,
+              uint32_t color,
+              int radius)
+          {
+              lv_obj_set_style_bg_color(
+                  object, lv_color_hex(color), 0);
+              lv_obj_set_style_bg_opa(
+                  object, LV_OPA_COVER, 0);
+              lv_obj_set_style_radius(
+                  object, radius, 0);
+              lv_obj_set_style_border_width(
+                  object, 0, 0);
+              lv_obj_set_style_pad_all(
+                  object, 0, 0);
+              lv_obj_clear_flag(
+                  object, LV_OBJ_FLAG_SCROLLABLE);
+          }
+
+          static lv_obj_t *create_label(
+              lv_obj_t *parent,
+              const char *text,
+              const html_style_t *style,
+              const char *element)
+          {
+              if (style->hidden) return NULL;
+
+              lv_obj_t *label = lv_label_create(parent);
+              lv_label_set_text(label, text);
+              lv_obj_set_pos(label, style->x, style->y);
+              lv_obj_set_width(label, style->width);
+              lv_obj_set_height(label, style->height);
+              lv_obj_set_style_text_font(
+                  label,
+                  font_for_element(element, text, style->font_size),
+                  0);
+              lv_obj_set_style_text_color(label, lv_color_hex(active_text_color(style)), 0);
+              lv_obj_set_style_text_align(label, style->align, 0);
+
+              char scroll_value[12] = "";
+              if (element != NULL &&
+                  extract_attribute(element, "data-scroll", scroll_value, sizeof(scroll_value)) &&
+                  strcasecmp(scroll_value, "true") == 0) {
+                  lv_label_set_long_mode(label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+              } else {
+                  lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
+              }
+              return label;
+          }
+
+          static bool clock_is_valid(void)
+          {
+              return time(NULL) >= 1735689600;
+          }
+
+          static int64_t stopwatch_elapsed_now(void)
+          {
+              if (!stopwatch_running) {
+                  return stopwatch_accumulated_us;
+              }
+
+              return stopwatch_accumulated_us +
+                     (esp_timer_get_time() - stopwatch_started_us);
+          }
+
+          static void save_theme_preference(void)
+          {
+              nvs_handle_t handle;
+
+              if (nvs_open(
+                      "display_cfg",
+                      NVS_READWRITE,
+                      &handle) != ESP_OK) {
+                  return;
+              }
+
+              nvs_set_u8(handle, "dark", dark_mode ? 1 : 0);
+              nvs_commit(handle);
+              nvs_close(handle);
+          }
+
+          static void load_theme_preference(void)
+          {
+              nvs_handle_t handle;
+              uint8_t value = 0;
+
+              if (nvs_open(
+                      "display_cfg",
+                      NVS_READONLY,
+                      &handle) != ESP_OK) {
+                  return;
+              }
+
+              if (nvs_get_u8(handle, "dark", &value) == ESP_OK) {
+                  dark_mode = value != 0;
+                  theme_loaded_from_nvs = true;
+              }
+
+              nvs_close(handle);
+          }
+
+          static void load_weather_station(void)
+          {
+              nvs_handle_t handle;
+              size_t length = sizeof(weather_station);
+
+              if (nvs_open(
+                      "weather_cfg",
+                      NVS_READONLY,
+                      &handle) != ESP_OK) {
+                  return;
+              }
+
+              char stored[sizeof(weather_station)] = "";
+              if (nvs_get_str(
+                      handle,
+                      "station",
+                      stored,
+                      &length) == ESP_OK &&
+                  weather_station_is_valid(stored)) {
+                  strlcpy(
+                      weather_station,
+                      stored,
+                      sizeof(weather_station));
+              }
+
+              nvs_close(handle);
+          }
+
+          static esp_err_t save_weather_station(const char *station)
+          {
+              if (!weather_station_is_valid(station)) {
+                  return ESP_ERR_INVALID_ARG;
+              }
+
+              nvs_handle_t handle;
+              esp_err_t error =
+                  nvs_open(
+                      "weather_cfg",
+                      NVS_READWRITE,
+                      &handle);
+
+              if (error != ESP_OK) {
+                  return error;
+              }
+
+              error = nvs_set_str(handle, "station", station);
+              if (error == ESP_OK) {
+                  error = nvs_commit(handle);
+              }
+
+              nvs_close(handle);
+
+              if (error == ESP_OK) {
+                  strlcpy(
+                      weather_station,
+                      station,
+                      sizeof(weather_station));
+              }
+
+              return error;
+          }
+
+          static char *read_text_file(
+              const char *path,
+              size_t maximum)
+          {
+              FILE *file = fopen(path, "rb");
+              if (file == NULL) {
+                  return NULL;
+              }
+
+              if (fseek(file, 0, SEEK_END) != 0) {
+                  fclose(file);
+                  return NULL;
+              }
+
+              long length = ftell(file);
+              if (length < 0 || (size_t)length > maximum) {
+                  fclose(file);
+                  return NULL;
+              }
+
+              rewind(file);
+              char *buffer = calloc(1, (size_t)length + 1);
+              if (buffer == NULL) {
+                  fclose(file);
+                  return NULL;
+              }
+
+              size_t read_count =
+                  fread(buffer, 1, (size_t)length, file);
+              fclose(file);
+
+              if (read_count != (size_t)length) {
+                  free(buffer);
+                  return NULL;
+              }
+
+              buffer[length] = '\0';
+              return buffer;
+          }
+
+          static esp_err_t write_display_html(
+              const char *html,
+              size_t length)
+          {
+              if (html == NULL ||
+                  length == 0 ||
+                  length > DISPLAY_HTML_MAX ||
+                  strstr(html, "<body") == NULL ||
+                  find_element(
+                      html, "data-widget", "clock") == NULL) {
+                  return ESP_ERR_INVALID_ARG;
+              }
+
+              FILE *file = fopen(DISPLAY_HTML_TEMP_PATH, "wb");
+              if (file == NULL) {
+                  return ESP_FAIL;
+              }
+
+              size_t written = fwrite(html, 1, length, file);
+              fclose(file);
+
+              if (written != length) {
+                  unlink(DISPLAY_HTML_TEMP_PATH);
+                  return ESP_FAIL;
+              }
+
+              unlink(DISPLAY_HTML_PATH);
+
+              if (rename(
+                      DISPLAY_HTML_TEMP_PATH,
+                      DISPLAY_HTML_PATH) != 0) {
+                  unlink(DISPLAY_HTML_TEMP_PATH);
+                  return ESP_FAIL;
+              }
+
+              html_file_ready = true;
+              return ESP_OK;
+          }
+
+          static esp_err_t ensure_default_display_html(void)
+          {
+              char *existing =
+                  read_text_file(
+                      DISPLAY_HTML_PATH,
+                      DISPLAY_HTML_MAX);
+
+              if (existing != NULL) {
+                  html_file_ready = true;
+                  free(existing);
+                  return ESP_OK;
+              }
+
+              return write_display_html(
+                  DEFAULT_DISPLAY_HTML,
+                  strlen(DEFAULT_DISPLAY_HTML));
+          }
+
+
+          typedef struct {
+              char *data;
+              size_t length;
+              size_t capacity;
+          } hko_http_buffer_t;
+
+          static lv_timer_t *full_redraw_timer = NULL;
+          static uint8_t full_redraw_passes = 0;
+
+          static void full_redraw_timer_cb(lv_timer_t *timer)
+          {
+              lv_obj_t *screen = lv_screen_active();
+
+              if (screen != NULL) {
+                  lv_obj_invalidate(screen);
+              }
+
+              if (full_redraw_passes > 0) {
+                  full_redraw_passes--;
+              }
+
+              if (full_redraw_passes == 0) {
+                  lv_timer_delete(timer);
+                  full_redraw_timer = NULL;
+              }
+          }
+
+          static void schedule_full_redraw(void)
+          {
+              lv_obj_t *screen = lv_screen_active();
+
+              if (screen != NULL) {
+                  lv_obj_invalidate(screen);
+              }
+
+              full_redraw_passes = 6;
+
+              if (full_redraw_timer == NULL) {
+                  full_redraw_timer =
+                      lv_timer_create(
+                          full_redraw_timer_cb,
+                          25,
+                          NULL);
+              } else {
+                  lv_timer_reset(full_redraw_timer);
+              }
+          }
+
+          static esp_err_t hko_http_event_handler(
+              esp_http_client_event_t *event)
+          {
+              hko_http_buffer_t *buffer = event->user_data;
+
+              if (event->event_id != HTTP_EVENT_ON_DATA ||
+                  event->data_len <= 0 ||
+                  buffer == NULL) {
+                  return ESP_OK;
+              }
+
+              if (buffer->length + (size_t)event->data_len + 1 >
+                  buffer->capacity) {
+                  return ESP_ERR_NO_MEM;
+              }
+
+              memcpy(
+                  buffer->data + buffer->length,
+                  event->data,
+                  (size_t)event->data_len);
+              buffer->length += (size_t)event->data_len;
+              buffer->data[buffer->length] = '\0';
+              return ESP_OK;
+          }
+
+          static esp_err_t hko_http_get(
+              const char *url,
+              char **response)
+          {
+              if (response == NULL) {
+                  return ESP_ERR_INVALID_ARG;
+              }
+
+              *response = NULL;
+
+              hko_http_buffer_t buffer = {
+                  .data = calloc(1, HKO_HTTP_MAX),
+                  .length = 0,
+                  .capacity = HKO_HTTP_MAX,
+              };
+
+              if (buffer.data == NULL) {
+                  return ESP_ERR_NO_MEM;
+              }
+
+              esp_http_client_config_t configuration = {
+                  .url = url,
+                  .event_handler = hko_http_event_handler,
+                  .user_data = &buffer,
+                  .timeout_ms = 15000,
+                  .buffer_size = 2048,
+                  .buffer_size_tx = 512,
+                  .crt_bundle_attach = esp_crt_bundle_attach,
+                  .keep_alive_enable = true,
+              };
+
+              esp_http_client_handle_t client =
+                  esp_http_client_init(&configuration);
+
+              if (client == NULL) {
+                  free(buffer.data);
+                  return ESP_FAIL;
+              }
+
+              esp_err_t error = esp_http_client_perform(client);
+              int status_code =
+                  esp_http_client_get_status_code(client);
+              esp_http_client_cleanup(client);
+
+              if (error != ESP_OK ||
+                  status_code != 200 ||
+                  buffer.length == 0) {
+                  free(buffer.data);
+                  return error == ESP_OK ? ESP_FAIL : error;
+              }
+
+              *response = buffer.data;
+              return ESP_OK;
+          }
+
+          static const char *hko_condition_from_icon_tc(int icon)
+          {
+              switch (icon) {
+                  case 50: return "天晴";
+                  case 51: return "部分時間有陽光";
+                  case 52: return "短暫時間有陽光";
+                  case 53: return "有陽光，亦有幾陣驟雨";
+                  case 54: return "短暫陽光，有幾陣驟雨";
+                  case 60: return "多雲";
+                  case 61: return "密雲";
+                  case 62: return "微雨";
+                  case 63: return "有驟雨";
+                  case 64: return "有大雨";
+                  case 65: return "有雷暴";
+                  case 76: return "大致多雲";
+                  case 77: return "大致天晴";
+                  case 80: return "風勢頗大";
+                  case 81: return "天氣乾燥";
+                  case 82: return "天氣潮濕";
+                  case 83: return "有霧";
+                  case 84: return "有薄霧";
+                  case 85: return "有煙霞";
+                  case 90: return "酷熱";
+                  case 91: return "炎熱";
+                  case 92: return "清涼";
+                  case 93: return "寒冷";
+                  default: return "天氣資料更新中";
+              }
+          }
+
+          static void copy_utf8_safe(const char *source, char *destination, size_t size)
+          {
+              if (size == 0) return;
+              destination[0] = '\0';
+              if (source == NULL) return;
+              size_t in = 0, out = 0;
+              while (source[in] && out + 1 < size) {
+                  unsigned char c = (unsigned char)source[in];
+                  size_t bytes = c < 0x80 ? 1 : ((c & 0xE0) == 0xC0 ? 2 : ((c & 0xF0) == 0xE0 ? 3 : 4));
+                  if (out + bytes >= size) break;
+                  for (size_t j=0;j<bytes && source[in+j];j++) destination[out++] = source[in+j];
+                  in += bytes;
+              }
+              destination[out] = '\0';
+          }
+
+          static void copy_first_sentence(const char *source, char *destination, size_t size)
+          {
+              if (source == NULL) { copy_utf8_safe("暫未有詳細預報",destination,size); return; }
+              const char *stop = strstr(source, "。");
+              if (stop == NULL) { copy_utf8_safe(source,destination,size); return; }
+              size_t length = (size_t)(stop - source) + strlen("。");
+              if (length >= size) length = size - 1;
+              memcpy(destination, source, length);
+              destination[length] = '\0';
+          }
+
+          static bool extract_two_temperatures(const char *text, int *minimum, int *maximum)
+          {
+              if (!text || !minimum || !maximum) return false;
+              const char *p = strstr(text, "氣溫介乎");
+              if (!p) p = text;
+              int values[2] = {-1000,-1000}; int count = 0;
+              while (*p && count < 2) {
+                  if (*p >= '0' && *p <= '9') {
+                      char *end_pointer = NULL;
+                      values[count++] = (int)strtol(p, &end_pointer, 10);
+                      p = end_pointer;
+                  } else {
+                      p++;
+                  }
+              }
+              if (count == 2) { *minimum=values[0]; *maximum=values[1]; return true; }
+              return false;
+          }
+
+          static void refresh_weather_labels(void)
+          {
+              lv_lock();
+              if (location_label) lv_label_set_text(location_label, weather_station);
+              if (current_temp_label) lv_label_set_text(current_temp_label,current_temp_text);
+              if (current_condition_label) lv_label_set_text(current_condition_label,current_condition_text);
+              if (today_range_label) lv_label_set_text(today_range_label,today_range_text);
+              if (humidity_label) lv_label_set_text(humidity_label,humidity_text);
+              if (rainfall_label) lv_label_set_text(rainfall_label,rainfall_text);
+              if (sunrise_label) lv_label_set_text(sunrise_label,sunrise_text);
+              if (nowcast_summary_label) lv_label_set_text(nowcast_summary_label,nowcast_summary_text);
+              if (nowcast_detail_label) lv_label_set_text(nowcast_detail_label,nowcast_detail_text);
+              if (alert_label) lv_label_set_text(alert_label,alert_text);
+              for (int i=0;i<2;i++) if (forecast_label[i]) lv_label_set_text(forecast_label[i],forecast_text[i]);
+              if (weather_update_label) lv_label_set_text(weather_update_label,weather_update_text);
+              lv_unlock();
+          }
+
+          static esp_err_t parse_hko_current(const char *json_text)
+          {
+              cJSON *root = cJSON_Parse(json_text); if (!root) return ESP_FAIL;
+              int temperature=-1000, humidity=-1, icon=-1;
+              cJSON *data = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(root,"temperature"),"data");
+              cJSON *entry=NULL;
+              cJSON_ArrayForEach(entry,data) {
+                  cJSON *place=cJSON_GetObjectItemCaseSensitive(entry,"place");
+                  cJSON *value=cJSON_GetObjectItemCaseSensitive(entry,"value");
+                  if (cJSON_IsString(place)&&cJSON_IsNumber(value)&&strcmp(place->valuestring,weather_station)==0) {temperature=value->valueint;break;}
+              }
+              cJSON *hdata=cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(root,"humidity"),"data");
+              cJSON *hvalue=cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(hdata,0),"value");
+              if(cJSON_IsNumber(hvalue)) humidity=hvalue->valueint;
+              cJSON *iv=cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(root,"icon"),0); if(cJSON_IsNumber(iv))icon=iv->valueint;
+              if(temperature>-1000) snprintf(current_temp_text,sizeof(current_temp_text),"%d°C",temperature); else strlcpy(current_temp_text,"--°C",sizeof(current_temp_text));
+              snprintf(current_condition_text,sizeof(current_condition_text),"而家%s",hko_condition_from_icon_tc(icon));
+              if(humidity>=0) snprintf(humidity_text,sizeof(humidity_text),"相對濕度 %d%%",humidity); else strlcpy(humidity_text,"相對濕度暫未有資料",sizeof(humidity_text));
+
+              const char *tip=NULL;
+              cJSON *tips=cJSON_GetObjectItemCaseSensitive(root,"specialWxTips");
+              cJSON *warnings=cJSON_GetObjectItemCaseSensitive(root,"warningMessage");
+              cJSON *first=cJSON_GetArrayItem(tips,0); if(cJSON_IsString(first))tip=first->valuestring;
+              if(!tip){first=cJSON_GetArrayItem(warnings,0);if(cJSON_IsString(first))tip=first->valuestring;}
+              if(tip) copy_utf8_safe(tip,alert_text,sizeof(alert_text)); else strlcpy(alert_text,"暫時未有特別天氣提示",sizeof(alert_text));
+
+              cJSON *update=cJSON_GetObjectItemCaseSensitive(root,"updateTime");
+              if(cJSON_IsString(update)&&strlen(update->valuestring)>=16) snprintf(weather_update_text,sizeof(weather_update_text),"天文台更新：%.5s",update->valuestring+11);
+              cJSON_Delete(root); return temperature>-1000?ESP_OK:ESP_FAIL;
+          }
+
+          static esp_err_t parse_hko_local_forecast(const char *json_text)
+          {
+              cJSON *root = cJSON_Parse(json_text);
+              if (root == NULL) {
+                  return ESP_FAIL;
+              }
+
+              cJSON *outlook =
+                  cJSON_GetObjectItemCaseSensitive(root, "outlook");
+              if (cJSON_IsString(outlook)) {
+                  copy_first_sentence(
+                      outlook->valuestring,
+                      forecast_text[2],
+                      sizeof(forecast_text[2]));
+              }
+
+              cJSON_Delete(root);
+              return ESP_OK;
+          }
+
+          static void relation_for_date(const char *forecast_date, int index, char *out, size_t out_size)
+          {
+              time_t now=time(NULL); struct tm local; localtime_r(&now,&local);
+              char today[16],tomorrow[16]; strftime(today,sizeof(today),"%Y%m%d",&local);
+              now += 24*60*60; localtime_r(&now,&local); strftime(tomorrow,sizeof(tomorrow),"%Y%m%d",&local);
+              if(forecast_date && strcmp(forecast_date,today)==0) strlcpy(out,"今日",out_size);
+              else if(forecast_date && strcmp(forecast_date,tomorrow)==0) strlcpy(out,"聽日",out_size);
+              else strlcpy(out,index==0?"聽日":"後日",out_size);
+          }
+
+          static esp_err_t parse_hko_forecast(const char *json_text)
+          {
+              cJSON *root = cJSON_Parse(json_text);
+              if (root == NULL) {
+                  return ESP_FAIL;
+              }
+
+              cJSON *array =
+                  cJSON_GetObjectItemCaseSensitive(root, "weatherForecast");
+              if (!cJSON_IsArray(array)) {
+                  cJSON_Delete(root);
+                  return ESP_FAIL;
+              }
+
+              char target_dates[3][16];
+              time_t base_time = time(NULL);
+              for (int day = 0; day < 3; day++) {
+                  struct tm local_time;
+                  time_t target_time =
+                      base_time + (time_t)day * 24 * 60 * 60;
+                  localtime_r(&target_time, &local_time);
+                  strftime(
+                      target_dates[day],
+                      sizeof(target_dates[day]),
+                      "%Y%m%d",
+                      &local_time);
+              }
+
+              bool found_today = false;
+              bool found_future[2] = {false, false};
+              cJSON *item = NULL;
+
+              cJSON_ArrayForEach(item, array) {
+                  cJSON *date =
+                      cJSON_GetObjectItemCaseSensitive(item, "forecastDate");
+                  if (!cJSON_IsString(date)) {
+                      continue;
+                  }
+
+                  cJSON *minimum =
+                      cJSON_GetObjectItemCaseSensitive(
+                          cJSON_GetObjectItemCaseSensitive(
+                              item,
+                              "forecastMintemp"),
+                          "value");
+                  cJSON *maximum =
+                      cJSON_GetObjectItemCaseSensitive(
+                          cJSON_GetObjectItemCaseSensitive(
+                              item,
+                              "forecastMaxtemp"),
+                          "value");
+
+                  if (strcmp(date->valuestring, target_dates[0]) == 0 &&
+                      cJSON_IsNumber(minimum) &&
+                      cJSON_IsNumber(maximum)) {
+                      snprintf(
+                          today_range_text,
+                          sizeof(today_range_text),
+                          "本港今日 %d–%d°C",
+                          minimum->valueint,
+                          maximum->valueint);
+                      found_today = true;
+                      continue;
+                  }
+
+                  int future_index = -1;
+                  if (strcmp(date->valuestring, target_dates[1]) == 0) {
+                      future_index = 0;
+                  } else if (strcmp(date->valuestring, target_dates[2]) == 0) {
+                      future_index = 1;
+                  }
+                  if (future_index < 0) {
+                      continue;
+                  }
+
+                  cJSON *week =
+                      cJSON_GetObjectItemCaseSensitive(item, "week");
+                  cJSON *weather =
+                      cJSON_GetObjectItemCaseSensitive(item, "forecastWeather");
+                  cJSON *psr =
+                      cJSON_GetObjectItemCaseSensitive(item, "PSR");
+
+                  char short_weather[128];
+                  copy_first_sentence(
+                      cJSON_IsString(weather) ? weather->valuestring : NULL,
+                      short_weather,
+                      sizeof(short_weather));
+
+                  snprintf(
+                      forecast_text[future_index],
+                      sizeof(forecast_text[future_index]),
+                      "%s %s　%d–%d°C｜落雨風險%s\\n%s",
+                      future_index == 0 ? "聽日" : "後日",
+                      cJSON_IsString(week) ? week->valuestring : "",
+                      cJSON_IsNumber(minimum) ? minimum->valueint : 0,
+                      cJSON_IsNumber(maximum) ? maximum->valueint : 0,
+                      cJSON_IsString(psr) ? psr->valuestring : "—",
+                      short_weather);
+                  found_future[future_index] = true;
+              }
+
+              if (!found_today) {
+                  strlcpy(
+                      today_range_text,
+                      "本港今日溫度範圍暫未有資料",
+                      sizeof(today_range_text));
+              }
+              if (!found_future[0]) {
+                  strlcpy(
+                      forecast_text[0],
+                      "聽日預報暫時攞唔到",
+                      sizeof(forecast_text[0]));
+              }
+              if (!found_future[1]) {
+                  strlcpy(
+                      forecast_text[1],
+                      "後日預報暫時攞唔到",
+                      sizeof(forecast_text[1]));
+              }
+
+              cJSON_Delete(root);
+              return found_future[0] || found_future[1]
+                  ? ESP_OK
+                  : ESP_FAIL;
+          }
+
+          static esp_err_t parse_hourly_rainfall(const char *json_text)
+          {
+              cJSON *root=cJSON_Parse(json_text); if(!root)return ESP_FAIL;
+              const weather_location_t *location=find_weather_location(weather_station);
+              cJSON *array=cJSON_GetObjectItemCaseSensitive(root,"hourlyRainfall"); cJSON *entry=NULL; const char *rain=NULL;
+              cJSON_ArrayForEach(entry,array){cJSON *station=cJSON_GetObjectItemCaseSensitive(entry,"automaticWeatherStation");cJSON *value=cJSON_GetObjectItemCaseSensitive(entry,"value");if(cJSON_IsString(station)&&cJSON_IsString(value)&&strcmp(station->valuestring,location->rain_station)==0){rain=value->valuestring;break;}}
+              if(rain&&strcmp(rain,"M")!=0) snprintf(rainfall_text,sizeof(rainfall_text),"過去一小時雨量 %s 毫米",rain); else strlcpy(rainfall_text,"過去一小時雨量暫未有資料",sizeof(rainfall_text));
+              cJSON_Delete(root); return rain?ESP_OK:ESP_FAIL;
+          }
+
+          static esp_err_t parse_sunrise_sunset(const char *json_text)
+          {
+              cJSON *root=cJSON_Parse(json_text); if(!root)return ESP_FAIL;
+              cJSON *data=cJSON_GetObjectItemCaseSensitive(root,"data"); cJSON *row=cJSON_GetArrayItem(data,0);
+              cJSON *sunrise=cJSON_GetArrayItem(row,1); cJSON *sunset=cJSON_GetArrayItem(row,3);
+              bool valid = cJSON_IsString(sunrise) && cJSON_IsString(sunset);
+              if(valid) {
+                  snprintf(sunrise_text,sizeof(sunrise_text),"日出 %s　日落 %s",sunrise->valuestring,sunset->valuestring);
+              } else {
+                  strlcpy(sunrise_text,"日出日落資料暫未有",sizeof(sunrise_text));
+              }
+              cJSON_Delete(root);
+              return valid ? ESP_OK : ESP_FAIL;
+          }
+
+          typedef struct {
+              char line[192]; size_t line_length;
+              double target_lat,target_lon;
+              char endings[NOWCAST_SLOT_COUNT][16];
+              double rainfall[NOWCAST_SLOT_COUNT];
+              double best_distance[NOWCAST_SLOT_COUNT];
+              int slots;
+          } nowcast_context_t;
+
+          static void nowcast_process_line(nowcast_context_t *ctx, const char *line)
+          {
+              char updated[16],ending[16]; double lat,lon,rain;
+              if(sscanf(line,"%15[^,],%15[^,],%lf,%lf,%lf",updated,ending,&lat,&lon,&rain)!=5||!isdigit((unsigned char)updated[0]))return;
+              int slot=-1; for(int i=0;i<ctx->slots;i++)if(strcmp(ctx->endings[i],ending)==0){slot=i;break;}
+              if(slot<0&&ctx->slots<NOWCAST_SLOT_COUNT){slot=ctx->slots++;strlcpy(ctx->endings[slot],ending,sizeof(ctx->endings[slot]));ctx->best_distance[slot]=1e9;}
+              if(slot<0)return;
+              double dlat=lat-ctx->target_lat; double dlon=(lon-ctx->target_lon)*0.92; double distance=dlat*dlat+dlon*dlon;
+              if(distance<ctx->best_distance[slot]){ctx->best_distance[slot]=distance;ctx->rainfall[slot]=rain;}
+          }
+
+          static esp_err_t nowcast_event_handler(esp_http_client_event_t *event)
+          {
+              nowcast_context_t *ctx=event->user_data;
+              if(event->event_id!=HTTP_EVENT_ON_DATA||!ctx||event->data_len<=0)return ESP_OK;
+              const char *data=event->data;
+              for(int i=0;i<event->data_len;i++){
+                  char c=data[i]; if(c=='\r')continue;
+                  if(c=='\n'){ctx->line[ctx->line_length]='\0';nowcast_process_line(ctx,ctx->line);ctx->line_length=0;}
+                  else if(ctx->line_length+1<sizeof(ctx->line))ctx->line[ctx->line_length++]=c;
+              }
+              return ESP_OK;
+          }
+
+          static esp_err_t fetch_rain_nowcast(void)
+          {
+              const weather_location_t *location=find_weather_location(weather_station);
+              nowcast_context_t ctx={.target_lat=location->latitude,.target_lon=location->longitude,.slots=0};
+              for(int i=0;i<NOWCAST_SLOT_COUNT;i++)ctx.best_distance[i]=1e9;
+              esp_http_client_config_t config={.url=HKO_NOWCAST_URL,.event_handler=nowcast_event_handler,.user_data=&ctx,.timeout_ms=45000,.buffer_size=4096,.buffer_size_tx=512,.crt_bundle_attach=esp_crt_bundle_attach,.keep_alive_enable=true};
+              esp_http_client_handle_t client=esp_http_client_init(&config); if(!client)return ESP_FAIL;
+              esp_err_t error=esp_http_client_perform(client); int status=esp_http_client_get_status_code(client); esp_http_client_cleanup(client);
+              if(ctx.line_length){ctx.line[ctx.line_length]='\0';nowcast_process_line(&ctx,ctx.line);}
+              if(error!=ESP_OK||status!=200||ctx.slots==0)return ESP_FAIL;
+              for(int i=0;i<ctx.slots-1;i++)for(int j=i+1;j<ctx.slots;j++)if(strcmp(ctx.endings[i],ctx.endings[j])>0){char t[16];strlcpy(t,ctx.endings[i],sizeof(t));strlcpy(ctx.endings[i],ctx.endings[j],sizeof(ctx.endings[i]));strlcpy(ctx.endings[j],t,sizeof(ctx.endings[j]));double r=ctx.rainfall[i];ctx.rainfall[i]=ctx.rainfall[j];ctx.rainfall[j]=r;}
+              double total=0;for(int i=0;i<ctx.slots;i++)total+=ctx.rainfall[i];
+              if(total<0.1)strlcpy(nowcast_summary_text,"未來兩個鐘暫時唔似會落雨",sizeof(nowcast_summary_text));
+              else if(total<2.0)strlcpy(nowcast_summary_text,"可能有幾滴雨，帶把遮穩陣",sizeof(nowcast_summary_text));
+              else if(total<10.0)strlcpy(nowcast_summary_text,"有機會有驟雨，出街記得帶遮",sizeof(nowcast_summary_text));
+              else strlcpy(nowcast_summary_text,"未來兩個鐘雨勢可能較大，要留意",sizeof(nowcast_summary_text));
+              double r[4]={0,0,0,0};for(int i=0;i<ctx.slots&&i<4;i++)r[i]=ctx.rainfall[i];
+              snprintf(nowcast_detail_text,sizeof(nowcast_detail_text),"30分鐘 %.1f｜60分鐘 %.1f 毫米\n90分鐘 %.1f｜120分鐘 %.1f 毫米",r[0],r[1],r[2],r[3]);
+              return ESP_OK;
+          }
+
+          static void weather_task(void *argument)
+          {
+              (void)argument; weather_task_handle=xTaskGetCurrentTaskHandle();
+              for(;;){
+                  xEventGroupWaitBits(wifi_events,WIFI_CONNECTED_BIT,pdFALSE,pdTRUE,portMAX_DELAY);
+                  strlcpy(current_condition_text,"重新攞緊天文台資料…",sizeof(current_condition_text));
+                  strlcpy(weather_update_text,"連線去香港天文台…",sizeof(weather_update_text)); refresh_weather_labels();
+                  char *current=NULL,*forecast=NULL,*local=NULL,*hourly=NULL,*sun=NULL;
+                  esp_err_t rc=hko_http_get(HKO_CURRENT_URL,&current);
+                  esp_err_t rf=hko_http_get(HKO_FORECAST_URL,&forecast);
+                  esp_err_t rl=hko_http_get(HKO_LOCAL_FORECAST_URL,&local);
+                  esp_err_t rr=hko_http_get(HKO_HOURLY_RAIN_URL,&hourly);
+                  char sun_url[256]; time_t now=time(NULL); struct tm tm_now; localtime_r(&now,&tm_now);
+                  snprintf(sun_url,sizeof(sun_url),"https://data.weather.gov.hk/weatherAPI/opendata/opendata.php?dataType=SRS&rformat=json&year=%d&month=%d&day=%d",tm_now.tm_year+1900,tm_now.tm_mon+1,tm_now.tm_mday);
+                  esp_err_t rs=hko_http_get(sun_url,&sun);
+                  if (rc == ESP_OK) { rc = parse_hko_current(current); }
+                  if (rf == ESP_OK) { rf = parse_hko_forecast(forecast); }
+                  if (rl == ESP_OK) { rl = parse_hko_local_forecast(local); }
+                  if (rr == ESP_OK) { rr = parse_hourly_rainfall(hourly); }
+                  if (rs == ESP_OK) { rs = parse_sunrise_sunset(sun); }
+                  esp_err_t rn=fetch_rain_nowcast();
+                  free(current);free(forecast);free(local);free(hourly);free(sun);
+                  if(rc!=ESP_OK)strlcpy(current_condition_text,"即時天氣暫時攞唔到",sizeof(current_condition_text));
+                  if(rf!=ESP_OK){strlcpy(forecast_text[0],"聽日預報暫時攞唔到",sizeof(forecast_text[0]));strlcpy(forecast_text[1],"後日預報暫時攞唔到",sizeof(forecast_text[1]));}
+                  if(rr!=ESP_OK)strlcpy(rainfall_text,"過去一小時雨量暫未有資料",sizeof(rainfall_text));
+                  if(rs!=ESP_OK)strlcpy(sunrise_text,"日出日落資料暫未有",sizeof(sunrise_text));
+                  if(rn!=ESP_OK){strlcpy(nowcast_summary_text,"未來兩個鐘雨勢暫時攞唔到",sizeof(nowcast_summary_text));strlcpy(nowcast_detail_text,"請稍後再試，或者檢查網絡",sizeof(nowcast_detail_text));}
+                  refresh_weather_labels(); ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(HKO_REFRESH_MS));
+              }
+          }
+
+          static void install_hko_dashboard_once(void)
+          {
+              nvs_handle_t handle;
+              uint8_t installed = 0;
+
+              if (nvs_open(
+                      "display_cfg",
+                      NVS_READWRITE,
+                      &handle) != ESP_OK) {
+                  return;
+              }
+
+              nvs_get_u8(handle, "hko_dash_v3", &installed);
+
+              if (installed != 1 &&
+                  write_display_html(
+                      DEFAULT_DISPLAY_HTML,
+                      strlen(DEFAULT_DISPLAY_HTML)) == ESP_OK) {
+                  nvs_set_u8(handle, "hko_dash_v3", 1);
+                  nvs_commit(handle);
+              }
+
+              nvs_close(handle);
+          }
+
+          static void render_display_html(const char *html);
+
+          static void reload_display_locked(void)
+          {
+              char *html =
+                  read_text_file(
+                      DISPLAY_HTML_PATH,
+                      DISPLAY_HTML_MAX);
+
+              if (html == NULL) {
+                  render_display_html(DEFAULT_DISPLAY_HTML);
+                  schedule_full_redraw();
+                  return;
+              }
+
+              render_display_html(html);
+              free(html);
+              schedule_full_redraw();
+          }
+
+          static void reload_display_async(void *argument)
+          {
+              (void)argument;
+              reload_display_locked();
+          }
+
+          static void theme_clicked(lv_event_t *event)
+          {
+              (void)event;
+              dark_mode = !dark_mode;
+              save_theme_preference();
+              lv_async_call(reload_display_async, NULL);
+          }
+
+          static void stopwatch_toggle_clicked(lv_event_t *event)
+          {
+              (void)event;
+
+              int64_t now = esp_timer_get_time();
+
+              if (stopwatch_running) {
+                  stopwatch_accumulated_us +=
+                      now - stopwatch_started_us;
+                  stopwatch_running = false;
+              } else {
+                  stopwatch_started_us = now;
+                  stopwatch_running = true;
+              }
+          }
+
+          static void stopwatch_reset_clicked(lv_event_t *event)
+          {
+              (void)event;
+              stopwatch_running = false;
+              stopwatch_accumulated_us = 0;
+              stopwatch_started_us = 0;
+          }
+
+          static void create_button(
+              lv_obj_t *screen,
+              const char *html,
+              const char *action,
+              const char *default_text,
+              html_style_t defaults,
+              lv_event_cb_t callback)
+          {
+              const char *element =
+                  find_element(html, "data-action", action);
+
+              if (element == NULL) {
+                  return;
+              }
+
+              html_style_t style =
+                  read_style(element, defaults);
+
+              if (style.hidden) {
+                  return;
+              }
+
+              char text[64];
+              if (!extract_inner_text(
+                      element, text, sizeof(text)) ||
+                  text[0] == '\0') {
+                  strlcpy(text, default_text, sizeof(text));
+              }
+
+              lv_obj_t *button = lv_button_create(screen);
+              lv_obj_set_pos(button, style.x, style.y);
+              lv_obj_set_size(
+                  button, style.width, style.height);
+              lv_obj_set_style_bg_color(
+                  button,
+                  lv_color_hex(active_bg_color(&style)),
+                  0);
+              lv_obj_set_style_radius(
+                  button, style.radius, 0);
+              lv_obj_set_style_border_width(
+                  button, 0, 0);
+              lv_obj_add_event_cb(
+                  button, callback, LV_EVENT_CLICKED, NULL);
+
+              lv_obj_t *label = lv_label_create(button);
+              lv_label_set_text(label, text);
+              lv_obj_set_style_text_font(
+                  label, font_for_element(element, text, style.font_size), 0);
+              lv_obj_set_style_text_color(
+                  label,
+                  lv_color_hex(active_text_color(&style)),
+                  0);
+              lv_obj_center(label);
+          }
+
+          static lv_obj_t *create_widget_label(
+              lv_obj_t *screen,
+              const char *html,
+              const char *widget,
+              const char *default_text,
+              html_style_t defaults)
+          {
+              const char *element =
+                  find_element(html, "data-widget", widget);
+
+              if (element == NULL) {
+                  return NULL;
+              }
+
+              html_style_t style =
+                  read_style(element, defaults);
+              char text[256];
+
+              if (!extract_inner_text(
+                      element, text, sizeof(text)) ||
+                  text[0] == '\0' ||
+                  strstr(text, "{{") != NULL) {
+                  strlcpy(text, default_text, sizeof(text));
+              }
+
+              return create_label(screen, text, &style, element);
+          }
+
+          static void create_box_widget(
+              lv_obj_t *screen,
+              const char *html,
+              const char *widget,
+              html_style_t defaults)
+          {
+              const char *element = find_element(html, "data-widget", widget);
+              if (element == NULL) return;
+              html_style_t style = read_style(element, defaults);
+              if (style.hidden) return;
+              lv_obj_t *box = lv_obj_create(screen);
+              lv_obj_set_pos(box, style.x, style.y);
+              lv_obj_set_size(box, style.width, style.height);
+              style_box(box, active_bg_color(&style), style.radius);
+          }
+
+          static void render_display_html(const char *html)
+          {
+              lv_obj_t *screen = lv_screen_active();
+              lv_obj_clean(screen);
+              lv_obj_remove_style_all(screen);
+              lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+
+              clock_label = milliseconds_label = date_label = stopwatch_label = NULL;
+              wifi_label = sync_label = weather_now_label = weather_desc_label = NULL;
+              forecast_label[0] = forecast_label[1] = forecast_label[2] = NULL;
+              weather_update_label = location_label = current_temp_label = NULL;
+              current_condition_label = today_range_label = humidity_label = NULL;
+              rainfall_label = sunrise_label = nowcast_summary_label = NULL;
+              nowcast_detail_label = alert_label = NULL;
+
+              const char *body = strstr(html, "<body");
+              html_style_t body_defaults = {
+                  .x=0,.y=0,.width=800,.height=480,.font_size=18,.radius=0,
+                  .align=LV_TEXT_ALIGN_LEFT,.hidden=false,
+                  .light_color=0x000000,.dark_color=0xFFFFFF,
+                  .light_bg=0xEAF0F4,.dark_bg=0x070A0D,
+              };
+              html_style_t body_style = read_style(body, body_defaults);
+              lv_obj_set_style_bg_color(screen, lv_color_hex(active_bg_color(&body_style)), 0);
+              lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+
+              html_style_t panel = {.x=10,.y=8,.width=780,.height=464,.font_size=18,.radius=30,.align=LV_TEXT_ALIGN_LEFT,.hidden=false,.light_color=0,.dark_color=0,.light_bg=0xF9FBFC,.dark_bg=0x10151A};
+              create_box_widget(screen, html, "panel", panel);
+              html_style_t current_card = {.x=24,.y=166,.width=360,.height=180,.font_size=18,.radius=24,.align=LV_TEXT_ALIGN_LEFT,.hidden=false,.light_color=0,.dark_color=0,.light_bg=0xDCECF5,.dark_bg=0x182934};
+              html_style_t nowcast_card = {.x=400,.y=166,.width=376,.height=180,.font_size=18,.radius=24,.align=LV_TEXT_ALIGN_LEFT,.hidden=false,.light_color=0,.dark_color=0,.light_bg=0xE7E2F6,.dark_bg=0x28223B};
+              html_style_t forecast_card = {.x=24,.y=360,.width=368,.height=78,.font_size=18,.radius=20,.align=LV_TEXT_ALIGN_LEFT,.hidden=false,.light_color=0,.dark_color=0,.light_bg=0xEEF1F4,.dark_bg=0x192026};
+              create_box_widget(screen, html, "card-current", current_card);
+              create_box_widget(screen, html, "card-nowcast", nowcast_card);
+              create_box_widget(screen, html, "card-tomorrow", forecast_card);
+              forecast_card.x = 408;
+              create_box_widget(screen, html, "card-dayafter", forecast_card);
+
+              html_style_t d = {.x=30,.y=22,.width=330,.height=34,.font_size=26,.radius=0,.align=LV_TEXT_ALIGN_LEFT,.hidden=false,.light_color=0x15222C,.dark_color=0xF2F6F8,.light_bg=0,.dark_bg=0};
+              create_widget_label(screen,html,"title","香港天氣・時間",d);
+              d.x=30;d.y=56;d.width=410;d.height=26;d.font_size=18;d.light_color=0x667782;d.dark_color=0xA9B7C0;
+              date_label=create_widget_label(screen,html,"date","等緊網絡校時",d);
+              d.x=20;d.y=76;d.width=760;d.height=82;d.font_size=72;d.align=LV_TEXT_ALIGN_CENTER;d.light_color=0x081118;d.dark_color=0xFFFFFF;
+              clock_label=create_widget_label(screen,html,"clock","--:--:--",d);
+
+              html_style_t btn = {.x=646,.y=22,.width=122,.height=42,.font_size=20,.radius=21,.align=LV_TEXT_ALIGN_CENTER,.hidden=false,.light_color=0xFFFFFF,.dark_color=0x15222C,.light_bg=0x182630,.dark_bg=0xEEF4F7};
+              create_button(screen,html,"toggle-theme","深色 / 淺色",btn,theme_clicked);
+
+              d.x=42;d.y=184;d.width=310;d.height=32;d.font_size=26;d.align=LV_TEXT_ALIGN_LEFT;d.light_color=0x18384A;d.dark_color=0xD8F0FC;
+              location_label=create_widget_label(screen,html,"location",weather_station,d);
+              d.x=42;d.y=218;d.width=130;d.height=62;d.font_size=56;d.light_color=0x071219;d.dark_color=0xFFFFFF;
+              current_temp_label=create_widget_label(screen,html,"current-temp",current_temp_text,d);
+              d.x=168;d.y=220;d.width=190;d.height=28;d.font_size=18;d.light_color=0x18384A;d.dark_color=0xD8F0FC;
+              current_condition_label=create_widget_label(screen,html,"current-condition",current_condition_text,d);
+              d.y=250;d.height=26;d.light_color=0x415866;d.dark_color=0xB7CEDA;
+              today_range_label=create_widget_label(screen,html,"today-range",today_range_text,d);
+              d.y=278;humidity_label=create_widget_label(screen,html,"humidity",humidity_text,d);
+              d.x=42;d.y=303;d.width=316;d.height=23;
+              rainfall_label=create_widget_label(screen,html,"rainfall",rainfall_text,d);
+              d.y=326;d.height=22;
+              sunrise_label=create_widget_label(screen,html,"sunrise",sunrise_text,d);
+
+              d.x=420;d.y=184;d.width=330;d.height=32;d.font_size=26;d.light_color=0x35285B;d.dark_color=0xEEE8FF;
+              create_widget_label(screen,html,"nowcast-title","未來兩個鐘",d);
+              d.y=222;d.height=27;d.font_size=18;d.light_color=0x3E3262;d.dark_color=0xE2DAFA;
+              nowcast_summary_label=create_widget_label(screen,html,"nowcast-summary",nowcast_summary_text,d);
+              d.y=252;d.height=54;d.light_color=0x5B4E79;d.dark_color=0xC7BDE4;
+              nowcast_detail_label=create_widget_label(screen,html,"nowcast-detail",nowcast_detail_text,d);
+              d.y=313;d.height=25;d.light_color=0x6B2850;d.dark_color=0xFFB8D5;
+              alert_label=create_widget_label(screen,html,"alert",alert_text,d);
+
+              d.x=42;d.y=372;d.width=332;d.height=58;d.font_size=18;d.light_color=0x20313B;d.dark_color=0xE4EBEF;
+              forecast_label[0]=create_widget_label(screen,html,"forecast-1",forecast_text[0],d);
+              d.x=426;
+              forecast_label[1]=create_widget_label(screen,html,"forecast-2",forecast_text[1],d);
+
+              d.x=28;d.y=445;d.width=460;d.height=20;d.font_size=18;d.light_color=0x7B8992;d.dark_color=0x91A0AA;
+              weather_update_label=create_widget_label(screen,html,"weather-update",weather_update_text,d);
+              d.x=490;d.width=282;d.align=LV_TEXT_ALIGN_RIGHT;
+              wifi_label=create_widget_label(screen,html,"wifi",wifi_status_text,d);
+          }
+
+          static void clock_timer_cb(lv_timer_t *timer)
+          {
+              (void)timer;
+              if (clock_is_valid()) {
+                  struct timeval now;
+                  struct tm local_time;
+                  char clock_buffer[16];
+                  char date_buffer[96];
+                  static const char *weekdays[] = {"星期日","星期一","星期二","星期三","星期四","星期五","星期六"};
+                  gettimeofday(&now, NULL);
+                  localtime_r(&now.tv_sec, &local_time);
+                  strftime(clock_buffer, sizeof(clock_buffer), "%H:%M:%S", &local_time);
+                  snprintf(date_buffer,sizeof(date_buffer),"%d年%d月%d日　%s",local_time.tm_year+1900,local_time.tm_mon+1,local_time.tm_mday,weekdays[local_time.tm_wday]);
+                  if (clock_label) lv_label_set_text(clock_label, clock_buffer);
+                  if (date_label) lv_label_set_text(date_label, date_buffer);
+              } else {
+                  if (clock_label) lv_label_set_text(clock_label, "--:--:--");
+                  if (date_label) lv_label_set_text(date_label, "等緊網絡校時");
+              }
+          }
+
+          static esp_err_t initialise_nvs(void)
+          {
+              esp_err_t error = nvs_flash_init();
+
+              if (error == ESP_ERR_NVS_NO_FREE_PAGES ||
+                  error == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+                  ESP_ERROR_CHECK(nvs_flash_erase());
+                  error = nvs_flash_init();
+              }
+
+              return error;
+          }
+
+          static esp_err_t initialise_spiffs(void)
+          {
+              esp_vfs_spiffs_conf_t configuration = {
+                  .base_path = "/spiffs",
+                  .partition_label = "storage",
+                  .max_files = 5,
+                  .format_if_mount_failed = true,
+              };
+
+              return esp_vfs_spiffs_register(&configuration);
+          }
+
+          static void load_wifi_credentials(void)
+          {
+              nvs_handle_t handle;
+              size_t ssid_length = sizeof(saved_ssid);
+              size_t password_length = sizeof(saved_password);
+
+              saved_ssid[0] = '\0';
+              saved_password[0] = '\0';
+
+              if (nvs_open(
+                      "wifi_cfg",
+                      NVS_READONLY,
+                      &handle) != ESP_OK) {
+                  return;
+              }
+
+              if (nvs_get_str(
+                      handle,
+                      "ssid",
+                      saved_ssid,
+                      &ssid_length) != ESP_OK) {
+                  saved_ssid[0] = '\0';
+              }
+
+              if (nvs_get_str(
+                      handle,
+                      "password",
+                      saved_password,
+                      &password_length) != ESP_OK) {
+                  saved_password[0] = '\0';
+              }
+
+              nvs_close(handle);
+          }
+
+          static esp_err_t save_wifi_credentials(
+              const char *ssid,
+              const char *password)
+          {
+              nvs_handle_t handle;
+              esp_err_t error =
+                  nvs_open(
+                      "wifi_cfg",
+                      NVS_READWRITE,
+                      &handle);
+
+              if (error != ESP_OK) {
+                  return error;
+              }
+
+              error = nvs_set_str(handle, "ssid", ssid);
+              if (error == ESP_OK) {
+                  error =
+                      nvs_set_str(
+                          handle, "password", password);
+              }
+              if (error == ESP_OK) {
+                  error = nvs_commit(handle);
+              }
+
+              nvs_close(handle);
+              return error;
+          }
+
+          static void set_wifi_status(const char *text)
+          {
+              strlcpy(
+                  wifi_status_text,
+                  text,
+                  sizeof(wifi_status_text));
+
+              if (wifi_label != NULL) {
+                  lv_lock();
+                  lv_label_set_text(
+                      wifi_label, wifi_status_text);
+                  lv_unlock();
+              }
+          }
+
+          static void set_sync_status(const char *text)
+          {
+              strlcpy(
+                  sync_status_text,
+                  text,
+                  sizeof(sync_status_text));
+
+              if (sync_label != NULL) {
+                  lv_lock();
+                  lv_label_set_text(
+                      sync_label, sync_status_text);
+                  lv_unlock();
+              }
+          }
+
+          static void wifi_event_handler(
+              void *argument,
+              esp_event_base_t event_base,
+              int32_t event_id,
+              void *event_data)
+          {
+              (void)argument;
+
+              if (event_base == WIFI_EVENT &&
+                  event_id == WIFI_EVENT_STA_START &&
+                  saved_ssid[0] != '\0') {
+                  esp_wifi_connect();
+                  return;
+              }
+
+              if (event_base == WIFI_EVENT &&
+                  event_id == WIFI_EVENT_STA_DISCONNECTED) {
+                  xEventGroupClearBits(
+                      wifi_events,
+                      WIFI_CONNECTED_BIT);
+
+                  if (saved_ssid[0] != '\0') {
+                      set_wifi_status(
+                          "Wi-Fi: reconnecting...");
+                      set_sync_status(
+                          "WAITING FOR WI-FI");
+                      esp_wifi_connect();
+                  }
+                  return;
+              }
+
+              if (event_base == IP_EVENT &&
+                  event_id == IP_EVENT_STA_GOT_IP) {
+                  ip_event_got_ip_t *event = event_data;
+                  char text[128];
+
+                  snprintf(
+                      text,
+                      sizeof(text),
+                      "Wi-Fi: %s  " IPSTR "  |  OTA 192.168.4.1",
+                      saved_ssid,
+                      IP2STR(&event->ip_info.ip));
+                  set_wifi_status(text);
+
+                  xEventGroupSetBits(
+                      wifi_events,
+                      WIFI_CONNECTED_BIT);
+              }
+          }
+
+          static void start_wifi(void)
+          {
+              wifi_events = xEventGroupCreate();
+              load_wifi_credentials();
+
+              ESP_ERROR_CHECK(esp_netif_init());
+              ESP_ERROR_CHECK(
+                  esp_event_loop_create_default());
+              esp_netif_create_default_wifi_ap();
+              esp_netif_create_default_wifi_sta();
+
+              wifi_init_config_t init_configuration =
+                  WIFI_INIT_CONFIG_DEFAULT();
+              ESP_ERROR_CHECK(
+                  esp_wifi_init(&init_configuration));
+
+              ESP_ERROR_CHECK(
+                  esp_event_handler_register(
+                      WIFI_EVENT,
+                      ESP_EVENT_ANY_ID,
+                      wifi_event_handler,
+                      NULL));
+              ESP_ERROR_CHECK(
+                  esp_event_handler_register(
+                      IP_EVENT,
+                      IP_EVENT_STA_GOT_IP,
+                      wifi_event_handler,
+                      NULL));
+
+              wifi_config_t access_point = {0};
+              strlcpy(
+                  (char *)access_point.ap.ssid,
+                  SETUP_AP_SSID,
+                  sizeof(access_point.ap.ssid));
+              strlcpy(
+                  (char *)access_point.ap.password,
+                  SETUP_AP_PASS,
+                  sizeof(access_point.ap.password));
+              access_point.ap.ssid_len =
+                  strlen(SETUP_AP_SSID);
+              access_point.ap.channel = 1;
+              access_point.ap.max_connection = 4;
+              access_point.ap.authmode =
+                  WIFI_AUTH_WPA2_PSK;
+              access_point.ap.pmf_cfg.required = false;
+
+              ESP_ERROR_CHECK(
+                  esp_wifi_set_mode(WIFI_MODE_APSTA));
+              ESP_ERROR_CHECK(
+                  esp_wifi_set_config(
+                      WIFI_IF_AP, &access_point));
+
+              if (saved_ssid[0] != '\0') {
+                  wifi_config_t station = {0};
+
+                  strlcpy(
+                      (char *)station.sta.ssid,
+                      saved_ssid,
+                      sizeof(station.sta.ssid));
+                  strlcpy(
+                      (char *)station.sta.password,
+                      saved_password,
+                      sizeof(station.sta.password));
+
+                  station.sta.threshold.authmode =
+                      WIFI_AUTH_WPA2_PSK;
+                  station.sta.pmf_cfg.capable = true;
+                  station.sta.pmf_cfg.required = false;
+
+                  ESP_ERROR_CHECK(
+                      esp_wifi_set_config(
+                          WIFI_IF_STA, &station));
+              }
+
+              ESP_ERROR_CHECK(esp_wifi_start());
+          }
+
+          static bool url_decode(
+              char *destination,
+              size_t destination_size,
+              const char *source)
+          {
+              if (destination_size == 0) {
+                  return false;
+              }
+
+              size_t written = 0;
+
+              while (*source != '\0' &&
+                     written + 1 < destination_size) {
+                  if (*source == '%' &&
+                      source[1] != '\0' &&
+                      source[2] != '\0') {
+                      char hex[3] = {
+                          source[1],
+                          source[2],
+                          '\0',
+                      };
+                      destination[written++] =
+                          (char)strtol(hex, NULL, 16);
+                      source += 3;
+                  } else if (*source == '+') {
+                      destination[written++] = ' ';
+                      source++;
+                  } else {
+                      destination[written++] = *source++;
+                  }
+              }
+
+              destination[written] = '\0';
+              return *source == '\0';
+          }
+
+          static esp_err_t receive_request_body(
+              httpd_req_t *request,
+              char *buffer,
+              size_t length)
+          {
+              size_t received_total = 0;
+
+              while (received_total < length) {
+                  int count = httpd_req_recv(
+                      request,
+                      buffer + received_total,
+                      length - received_total);
+
+                  if (count == HTTPD_SOCK_ERR_TIMEOUT) {
+                      continue;
+                  }
+                  if (count <= 0) {
+                      return ESP_FAIL;
+                  }
+
+                  received_total += (size_t)count;
+              }
+
+              return ESP_OK;
+          }
+
+          static esp_err_t index_get_handler(
+              httpd_req_t *request)
+          {
+              httpd_resp_set_type(
+                  request, "text/html");
+              httpd_resp_set_hdr(
+                  request,
+                  "Cache-Control",
+                  "no-store");
+              return httpd_resp_send(
+                  request,
+                  MANAGEMENT_PAGE,
+                  HTTPD_RESP_USE_STRLEN);
+          }
+
+          static esp_err_t status_get_handler(
+              httpd_req_t *request)
+          {
+              bool connected =
+                  (xEventGroupGetBits(wifi_events) &
+                   WIFI_CONNECTED_BIT) != 0;
+              char ip_text[24] = "";
+
+              if (connected) {
+                  esp_netif_t *network_interface =
+                      esp_netif_get_handle_from_ifkey(
+                          "WIFI_STA_DEF");
+                  esp_netif_ip_info_t information;
+
+                  if (network_interface != NULL &&
+                      esp_netif_get_ip_info(
+                          network_interface,
+                          &information) == ESP_OK) {
+                      snprintf(
+                          ip_text,
+                          sizeof(ip_text),
+                          IPSTR,
+                          IP2STR(&information.ip));
+                  }
+              }
+
+              char response[512];
+              snprintf(
+                  response,
+                  sizeof(response),
+                  "{\"connected\":%s,"
+                  "\"ssid\":\"%s\","
+                  "\"ip\":\"%s\","
+                  "\"station\":\"%s\","
+                  "\"clock\":\"%s\","
+                  "\"html\":\"%s\"}",
+                  connected ? "true" : "false",
+                  saved_ssid,
+                  ip_text,
+                  weather_station,
+                  clock_is_valid()
+                      ? "NTP synchronized"
+                      : "waiting for NTP",
+                  html_file_ready
+                      ? "display.html ready"
+                      : "using built-in fallback");
+
+              httpd_resp_set_type(
+                  request, "application/json");
+              httpd_resp_set_hdr(
+                  request,
+                  "Cache-Control",
+                  "no-store");
+              return httpd_resp_sendstr(
+                  request, response);
+          }
+
+          static esp_err_t html_get_handler(
+              httpd_req_t *request)
+          {
+              char *html =
+                  read_text_file(
+                      DISPLAY_HTML_PATH,
+                      DISPLAY_HTML_MAX);
+
+              if (html == NULL) {
+                  httpd_resp_set_type(
+                      request,
+                      "text/plain; charset=utf-8");
+                  return httpd_resp_send(
+                      request,
+                      DEFAULT_DISPLAY_HTML,
+                      HTTPD_RESP_USE_STRLEN);
+              }
+
+              httpd_resp_set_type(
+                  request,
+                  "text/plain; charset=utf-8");
+              httpd_resp_set_hdr(
+                  request,
+                  "Cache-Control",
+                  "no-store");
+              esp_err_t result =
+                  httpd_resp_send(
+                      request,
+                      html,
+                      HTTPD_RESP_USE_STRLEN);
+              free(html);
+              return result;
+          }
+
+          static esp_err_t html_post_handler(
+              httpd_req_t *request)
+          {
+              if (request->content_len <= 0 ||
+                  request->content_len > DISPLAY_HTML_MAX) {
+                  httpd_resp_send_err(
+                      request,
+                      HTTPD_400_BAD_REQUEST,
+                      "HTML must be 1 to 16384 bytes");
+                  return ESP_FAIL;
+              }
+
+              char *html =
+                  calloc(
+                      1,
+                      request->content_len + 1);
+              if (html == NULL) {
+                  httpd_resp_send_err(
+                      request,
+                      HTTPD_500_INTERNAL_SERVER_ERROR,
+                      "Out of memory");
+                  return ESP_FAIL;
+              }
+
+              esp_err_t result =
+                  receive_request_body(
+                      request,
+                      html,
+                      request->content_len);
+
+              if (result != ESP_OK) {
+                  free(html);
+                  httpd_resp_send_err(
+                      request,
+                      HTTPD_400_BAD_REQUEST,
+                      "HTML receive failed");
+                  return ESP_FAIL;
+              }
+
+              html[request->content_len] = '\0';
+
+              result =
+                  write_display_html(
+                      html,
+                      request->content_len);
+
+              if (result != ESP_OK) {
+                  free(html);
+                  httpd_resp_send_err(
+                      request,
+                      HTTPD_400_BAD_REQUEST,
+                      "HTML must contain <body> and data-widget=clock");
+                  return ESP_FAIL;
+              }
+
+              lv_lock();
+              render_display_html(html);
+              schedule_full_redraw();
+              lv_unlock();
+              free(html);
+
+              httpd_resp_set_type(
+                  request,
+                  "text/plain; charset=utf-8");
+              return httpd_resp_sendstr(
+                  request,
+                  "Saved. The LCD has reloaded display.html.");
+          }
+
+          static esp_err_t default_post_handler(
+              httpd_req_t *request)
+          {
+              (void)request;
+
+              esp_err_t result =
+                  write_display_html(
+                      DEFAULT_DISPLAY_HTML,
+                      strlen(DEFAULT_DISPLAY_HTML));
+
+              if (result != ESP_OK) {
+                  httpd_resp_send_err(
+                      request,
+                      HTTPD_500_INTERNAL_SERVER_ERROR,
+                      "Could not restore default HTML");
+                  return ESP_FAIL;
+              }
+
+              lv_lock();
+              render_display_html(
+                  DEFAULT_DISPLAY_HTML);
+              schedule_full_redraw();
+              lv_unlock();
+
+              httpd_resp_set_type(
+                  request,
+                  "text/plain; charset=utf-8");
+              return httpd_resp_sendstr(
+                  request,
+                  "Default clock restored.");
+          }
+
+          static esp_err_t wifi_post_handler(
+              httpd_req_t *request)
+          {
+              if (request->content_len <= 0 ||
+                  request->content_len > 512) {
+                  httpd_resp_send_err(
+                      request,
+                      HTTPD_400_BAD_REQUEST,
+                      "Invalid form data");
+                  return ESP_FAIL;
+              }
+
+              char *body =
+                  calloc(
+                      1,
+                      request->content_len + 1);
+              if (body == NULL) {
+                  httpd_resp_send_err(
+                      request,
+                      HTTPD_500_INTERNAL_SERVER_ERROR,
+                      "Out of memory");
+                  return ESP_FAIL;
+              }
+
+              if (receive_request_body(
+                      request,
+                      body,
+                      request->content_len) != ESP_OK) {
+                  free(body);
+                  httpd_resp_send_err(
+                      request,
+                      HTTPD_400_BAD_REQUEST,
+                      "Form receive failed");
+                  return ESP_FAIL;
+              }
+
+              char encoded_ssid[100] = "";
+              char encoded_password[180] = "";
+              char decoded_ssid[33] = "";
+              char decoded_password[65] = "";
+
+              esp_err_t ssid_result =
+                  httpd_query_key_value(
+                      body,
+                      "ssid",
+                      encoded_ssid,
+                      sizeof(encoded_ssid));
+              esp_err_t password_result =
+                  httpd_query_key_value(
+                      body,
+                      "password",
+                      encoded_password,
+                      sizeof(encoded_password));
+              free(body);
+
+              if (ssid_result != ESP_OK ||
+                  !url_decode(
+                      decoded_ssid,
+                      sizeof(decoded_ssid),
+                      encoded_ssid)) {
+                  httpd_resp_send_err(
+                      request,
+                      HTTPD_400_BAD_REQUEST,
+                      "Invalid SSID");
+                  return ESP_FAIL;
+              }
+
+              if (password_result == ESP_OK &&
+                  !url_decode(
+                      decoded_password,
+                      sizeof(decoded_password),
+                      encoded_password)) {
+                  httpd_resp_send_err(
+                      request,
+                      HTTPD_400_BAD_REQUEST,
+                      "Invalid password");
+                  return ESP_FAIL;
+              }
+
+              if (decoded_ssid[0] == '\0' ||
+                  save_wifi_credentials(
+                      decoded_ssid,
+                      decoded_password) != ESP_OK) {
+                  httpd_resp_send_err(
+                      request,
+                      HTTPD_500_INTERNAL_SERVER_ERROR,
+                      "Could not save Wi-Fi details");
+                  return ESP_FAIL;
+              }
+
+              httpd_resp_set_type(
+                  request, "text/plain");
+              httpd_resp_sendstr(
+                  request,
+                  "Wi-Fi saved. The display is restarting.");
+              vTaskDelay(pdMS_TO_TICKS(1000));
+              esp_restart();
+              return ESP_OK;
+          }
+
+          static esp_err_t weather_location_post_handler(
+              httpd_req_t *request)
+          {
+              if (request->content_len <= 0 || request->content_len > 256) {
+                  httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "地區資料格式唔正確"); return ESP_FAIL;
+              }
+              char *body=calloc(1,request->content_len+1); if(!body){httpd_resp_send_err(request,HTTPD_500_INTERNAL_SERVER_ERROR,"記憶體不足");return ESP_FAIL;}
+              if(receive_request_body(request,body,request->content_len)!=ESP_OK){free(body);httpd_resp_send_err(request,HTTPD_400_BAD_REQUEST,"收唔到地區資料");return ESP_FAIL;}
+              char encoded[128]="",decoded[48]=""; esp_err_t q=httpd_query_key_value(body,"station",encoded,sizeof(encoded)); free(body);
+              if(q!=ESP_OK||!url_decode(decoded,sizeof(decoded),encoded)||!weather_station_is_valid(decoded)){httpd_resp_send_err(request,HTTPD_400_BAD_REQUEST,"呢個天氣站未支援");return ESP_FAIL;}
+              if(save_weather_station(decoded)!=ESP_OK){httpd_resp_send_err(request,HTTPD_500_INTERNAL_SERVER_ERROR,"儲存地區失敗");return ESP_FAIL;}
+              strlcpy(current_temp_text,"--°C",sizeof(current_temp_text)); strlcpy(current_condition_text,"地區已儲存，更新緊…",sizeof(current_condition_text)); strlcpy(weather_update_text,"重新攞緊香港天文台資料…",sizeof(weather_update_text)); refresh_weather_labels();
+              if(weather_task_handle)xTaskNotifyGive(weather_task_handle);
+              httpd_resp_set_type(request,"text/plain; charset=utf-8"); return httpd_resp_sendstr(request,"地區已儲存，個 Mon 正在即時更新。");
+          }
+
+          static esp_err_t weather_refresh_post_handler(
+              httpd_req_t *request)
+          {
+              (void)request; strlcpy(current_condition_text,"重新攞緊天文台資料…",sizeof(current_condition_text)); strlcpy(weather_update_text,"手動更新中…",sizeof(weather_update_text)); refresh_weather_labels(); if(weather_task_handle)xTaskNotifyGive(weather_task_handle); httpd_resp_set_type(request,"text/plain; charset=utf-8"); return httpd_resp_sendstr(request,"已經要求即時更新，通常幾秒至半分鐘會完成。");
+          }
+
+          static esp_err_t local_ota_post_handler(
+              httpd_req_t *request)
+          {
+              if (request->content_len <= 0) {
+                  httpd_resp_send_err(
+                      request,
+                      HTTPD_400_BAD_REQUEST,
+                      "Empty upload");
+                  return ESP_FAIL;
+              }
+
+              const esp_partition_t *partition =
+                  esp_ota_get_next_update_partition(NULL);
+
+              if (partition == NULL) {
+                  httpd_resp_send_err(
+                      request,
+                      HTTPD_500_INTERNAL_SERVER_ERROR,
+                      "No OTA partition");
+                  return ESP_FAIL;
+              }
+
+              esp_ota_handle_t ota_handle;
+              esp_err_t error =
+                  esp_ota_begin(
+                      partition,
+                      request->content_len,
+                      &ota_handle);
+
+              if (error != ESP_OK) {
+                  httpd_resp_send_err(
+                      request,
+                      HTTPD_500_INTERNAL_SERVER_ERROR,
+                      "OTA start failed");
+                  return ESP_FAIL;
+              }
+
+              char *buffer =
+                  malloc(LOCAL_OTA_BUFFER);
+              if (buffer == NULL) {
+                  esp_ota_abort(ota_handle);
+                  httpd_resp_send_err(
+                      request,
+                      HTTPD_500_INTERNAL_SERVER_ERROR,
+                      "Out of memory");
+                  return ESP_FAIL;
+              }
+
+              int remaining =
+                  request->content_len;
+
+              while (remaining > 0) {
+                  int wanted =
+                      remaining > LOCAL_OTA_BUFFER
+                          ? LOCAL_OTA_BUFFER
+                          : remaining;
+                  int count =
+                      httpd_req_recv(
+                          request,
+                          buffer,
+                          wanted);
+
+                  if (count == HTTPD_SOCK_ERR_TIMEOUT) {
+                      continue;
+                  }
+
+                  if (count <= 0 ||
+                      esp_ota_write(
+                          ota_handle,
+                          buffer,
+                          count) != ESP_OK) {
+                      free(buffer);
+                      esp_ota_abort(ota_handle);
+                      httpd_resp_send_err(
+                          request,
+                          HTTPD_500_INTERNAL_SERVER_ERROR,
+                          "OTA upload failed");
+                      return ESP_FAIL;
+                  }
+
+                  remaining -= count;
+              }
+
+              free(buffer);
+              error = esp_ota_end(ota_handle);
+
+              if (error != ESP_OK ||
+                  esp_ota_set_boot_partition(
+                      partition) != ESP_OK) {
+                  httpd_resp_send_err(
+                      request,
+                      HTTPD_400_BAD_REQUEST,
+                      "Invalid OTA APP firmware");
+                  return ESP_FAIL;
+              }
+
+              httpd_resp_set_type(
+                  request, "text/plain");
+              httpd_resp_sendstr(
+                  request,
+                  "Update successful. The display is restarting.");
+              vTaskDelay(pdMS_TO_TICKS(1000));
+              esp_restart();
+              return ESP_OK;
+          }
+
+          static void start_web_server(void)
+          {
+              httpd_config_t configuration =
+                  HTTPD_DEFAULT_CONFIG();
+              configuration.stack_size = 12288;
+              configuration.recv_wait_timeout = 60;
+              configuration.send_wait_timeout = 60;
+              configuration.max_uri_handlers = 12;
+
+              ESP_ERROR_CHECK(
+                  httpd_start(
+                      &web_server,
+                      &configuration));
+
+              const httpd_uri_t routes[] = {
+                  {
+                      .uri = "/",
+                      .method = HTTP_GET,
+                      .handler = index_get_handler,
+                  },
+                  {
+                      .uri = "/api/status",
+                      .method = HTTP_GET,
+                      .handler = status_get_handler,
+                  },
+                  {
+                      .uri = "/api/html",
+                      .method = HTTP_GET,
+                      .handler = html_get_handler,
+                  },
+                  {
+                      .uri = "/api/html",
+                      .method = HTTP_POST,
+                      .handler = html_post_handler,
+                  },
+                  {
+                      .uri = "/api/default",
+                      .method = HTTP_POST,
+                      .handler = default_post_handler,
+                  },
+                  {
+                      .uri = "/wifi",
+                      .method = HTTP_POST,
+                      .handler = wifi_post_handler,
+                  },
+                  {
+                      .uri = "/weather-location",
+                      .method = HTTP_POST,
+                      .handler = weather_location_post_handler,
+                  },
+                  {
+                      .uri = "/api/weather-refresh",
+                      .method = HTTP_POST,
+                      .handler = weather_refresh_post_handler,
+                  },
+                  {
+                      .uri = "/update",
+                      .method = HTTP_POST,
+                      .handler = local_ota_post_handler,
+                  },
+              };
+
+              for (size_t index = 0;
+                   index <
+                       sizeof(routes) /
+                       sizeof(routes[0]);
+                   ++index) {
+                  ESP_ERROR_CHECK(
+                      httpd_register_uri_handler(
+                          web_server,
+                          &routes[index]));
+              }
+          }
+
+          static esp_err_t ensure_sntp_time(void)
+          {
+              if (clock_is_valid()) {
+                  return ESP_OK;
+              }
+
+              if (!sntp_started) {
+                  esp_sntp_config_t configuration =
+                      ESP_NETIF_SNTP_DEFAULT_CONFIG(
+                          "pool.ntp.org");
+                  esp_err_t error =
+                      esp_netif_sntp_init(
+                          &configuration);
+
+                  if (error != ESP_OK &&
+                      error != ESP_ERR_INVALID_STATE) {
+                      return error;
+                  }
+
+                  sntp_started = true;
+              }
+
+              return esp_netif_sntp_sync_wait(
+                  pdMS_TO_TICKS(15000));
+          }
+
+          static void time_sync_task(void *argument)
+          {
+              (void)argument;
+
+              for (;;) {
+                  xEventGroupWaitBits(
+                      wifi_events,
+                      WIFI_CONNECTED_BIT,
+                      pdFALSE,
+                      pdTRUE,
+                      portMAX_DELAY);
+
+                  set_sync_status(
+                      "SYNCING HONG KONG TIME...");
+
+                  if (ensure_sntp_time() != ESP_OK) {
+                      set_sync_status(
+                          "TIME SYNC FAILED - RETRYING");
+                      vTaskDelay(
+                          pdMS_TO_TICKS(30000));
+                      continue;
+                  }
+
+                  set_sync_status(
+                      "TIME SYNCHRONIZED");
+                  vTaskDelay(
+                      pdMS_TO_TICKS(
+                          60 * 60 * 1000));
+              }
+          }
+
+          void app_main(void)
+          {
+              ESP_ERROR_CHECK(initialise_nvs());
+              ESP_ERROR_CHECK(initialise_spiffs());
+
+              load_theme_preference();
+              load_weather_station();
+              ESP_ERROR_CHECK(
+                  ensure_default_display_html());
+              install_hko_dashboard_once();
+
+              setenv("TZ", "HKT-8", 1);
+              tzset();
+
+              sunton_esp32s3_backlight_init();
+
+              lv_display_t *display =
+                  sunton_esp32s3_lcd_init();
+              (void)display;
+
+              i2c_master_bus_handle_t i2c_master =
+                  sunton_esp32s3_i2c_master();
+              sunton_esp32s3_touch_init(i2c_master);
+
+              lv_lock();
+              reload_display_locked();
+              lv_timer_create(
+                  clock_timer_cb, 20, NULL);
+              lv_unlock();
+
+              start_wifi();
+              start_web_server();
+
+              xTaskCreate(
+                  time_sync_task,
+                  "time_sync",
+                  4096,
+                  NULL,
+                  5,
+                  NULL);
+
+              xTaskCreate(
+                  weather_task,
+                  "hko_weather",
+                  14336,
+                  NULL,
+                  4,
+                  NULL);
+          }
+          MAIN_C
+          cat > project/main/CMakeLists.txt <<'CMAKE'
+          idf_component_register(
+              SRCS "main.c" "sunton_esp32_8048s050c.c"
+                   "hk_cjk_18.c" "hk_ui_26.c" "hk_digits_72.c" "hk_temp_56.c"
+              INCLUDE_DIRS "."
+              REQUIRES lvgl esp_lcd esp_lcd_touch_gt911 esp_timer nvs_flash esp_wifi esp_netif esp_event esp_http_server esp_http_client app_update spiffs json mbedtls lwip
+          )
+          CMAKE
+          cat > project/partitions_ota.csv <<'PARTITIONS'
+          # Name, Type, SubType, Offset, Size, Flags
+          nvs,data,nvs,0x9000,0x4000,
+          otadata,data,ota,0xd000,0x2000,
+          phy_init,data,phy,0xf000,0x1000,
+          factory,app,factory,0x10000,0x400000,
+          ota_0,app,ota_0,0x410000,0x400000,
+          ota_1,app,ota_1,0x810000,0x400000,
+          storage,data,spiffs,0xc10000,0x3f0000,
+          PARTITIONS
+          sed -i '/CONFIG_PARTITION_TABLE_/d' project/sdkconfig.defaults
+          cat >> project/sdkconfig.defaults <<'SDK'
+          CONFIG_PARTITION_TABLE_CUSTOM=y
+          CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_ota.csv"
+          CONFIG_PARTITION_TABLE_FILENAME="partitions_ota.csv"
+          CONFIG_LV_FONT_MONTSERRAT_14=y
+          CONFIG_LV_FONT_MONTSERRAT_20=y
+          CONFIG_LV_FONT_MONTSERRAT_28=y
+          CONFIG_LV_FONT_MONTSERRAT_32=y
+          CONFIG_LV_FONT_MONTSERRAT_36=y
+          CONFIG_LV_FONT_MONTSERRAT_48=y
+          SDK
+
+      - name: Build firmware
+        shell: bash
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE/project:/project" -w /project espressif/idf:v5.5.2 bash -lc '
+            set -e
+            git config --global --add safe.directory /project
+            . /opt/esp/idf/export.sh
+            rm -rf build sdkconfig
+            idf.py set-target esp32s3
+            idf.py build
+            idf.py merge-bin -f raw
+            cp build/merged-binary.bin /project/STEP6-HK-CHINESE-WEATHER-FULL.bin
+            cp build/ESP32-8048S050C.bin /project/STEP6-HK-CHINESE-WEATHER-OTA-APP.bin
+            ls -lh /project/STEP6-HK-CHINESE-WEATHER-*.bin
+          '
+
+      - name: Add instructions
+        shell: bash
+        run: |
+          cat > project/README-先睇.txt <<'TXT'
+          STEP 6 香港全中文天氣時鐘
+
+          OTA 只上載：STEP6-HK-CHINESE-WEATHER-OTA-APP.bin
+          千祈唔好經網頁 OTA 上載 FULL.bin。
+
+          功能：
+          - 香港繁體中文介面
+          - 72px 大時鐘、中文日期及星期
+          - 自選香港天文台地區氣溫站
+          - 即時氣溫、濕度、過去一小時雨量
+          - 全港預測最高及最低溫
+          - 未來兩小時網格雨量臨近預報
+          - 聽日及後日預報、落雨風險
+          - 日出及日落
+          - 天氣提示橫向滾動
+          - 深色／淺色模式
+          - 全新手機設定網站
+          TXT
+
+      - name: Upload firmware package
+        uses: actions/upload-artifact@v4
+        with:
+          name: STEP6-HK-Chinese-Weather
+          path: |
+            project/STEP6-HK-CHINESE-WEATHER-OTA-APP.bin
+            project/STEP6-HK-CHINESE-WEATHER-FULL.bin
+            project/README-先睇.txt
+          if-no-files-found: error
