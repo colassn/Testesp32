@@ -530,7 +530,7 @@ jobs:
           - No automatic cloud update
           EOF
 
-              ls -lh /project/ESP32-BUS-ARRIVAL-*.bin
+              ls -lh /project/STEP1-BUS-ARRIVAL-*.bin
             '
 
       - name: Upload firmware package
