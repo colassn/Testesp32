@@ -34,6 +34,12 @@ jobs:
         run: |
           git clone --depth 1 "$BOARD_REPOSITORY" project
 
+          # Wi-Fi and HTTPS traffic compete with the RGB panel for PSRAM/SPI
+          # bandwidth. Use the driver's bounce-buffer path and a conservative
+          # pixel clock to prevent horizontal wrap/shift on the 800x480 panel.
+          sed -i 's/\.pclk_hz = (18\*1000000)/.pclk_hz = (12*1000000)/' \
+            project/main/sunton_esp32_8048s050c.c
+
       - name: Add home Wi-Fi, setup portal, bus UI and cloud OTA
         env:
           BUILD_NUMBER: ${{ github.run_number }}
@@ -45,6 +51,7 @@ jobs:
           #include <stdio.h>
           #include <stdlib.h>
           #include <string.h>
+          #include <time.h>
 
           #include "freertos/FreeRTOS.h"
           #include "freertos/event_groups.h"
@@ -59,6 +66,7 @@ jobs:
           #include "esp_https_ota.h"
           #include "esp_log.h"
           #include "esp_netif.h"
+          #include "esp_netif_sntp.h"
           #include "esp_ota_ops.h"
           #include "esp_system.h"
           #include "esp_wifi.h"
@@ -839,6 +847,59 @@ jobs:
               }
           }
 
+          static bool cloud_clock_is_valid(void)
+          {
+              const time_t now = time(NULL);
+
+              // Any time after 2025-01-01 is sufficient for current HTTPS
+              // certificate validity checks.
+              return now >= 1735689600;
+          }
+
+          static esp_err_t ensure_cloud_clock(void)
+          {
+              static bool sntp_initialized = false;
+
+              if (cloud_clock_is_valid()) {
+                  return ESP_OK;
+              }
+
+              if (!sntp_initialized) {
+                  esp_sntp_config_t config =
+                      ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+
+                  esp_err_t error = esp_netif_sntp_init(&config);
+                  if (error != ESP_OK && error != ESP_ERR_INVALID_STATE) {
+                      ESP_LOGE(TAG, "SNTP init failed: %s",
+                               esp_err_to_name(error));
+                      return error;
+                  }
+
+                  sntp_initialized = true;
+              }
+
+              // Give DNS/NTP several short chances instead of blocking the UI
+              // for one long period.
+              for (int attempt = 0; attempt < 3; ++attempt) {
+                  esp_err_t error =
+                      esp_netif_sntp_sync_wait(pdMS_TO_TICKS(6000));
+
+                  if (error == ESP_OK && cloud_clock_is_valid()) {
+                      time_t now = time(NULL);
+                      ESP_LOGI(TAG, "Clock synchronized: %lld",
+                               (long long)now);
+                      return ESP_OK;
+                  }
+
+                  if (cloud_clock_is_valid()) {
+                      return ESP_OK;
+                  }
+              }
+
+              ESP_LOGW(TAG, "Clock synchronization timed out");
+              return ESP_ERR_TIMEOUT;
+          }
+
           static esp_err_t fetch_cloud_release(cloud_release_t *release)
           {
               esp_http_client_config_t config = {
@@ -959,13 +1020,26 @@ jobs:
                   cloud_release_t release = {0};
                   ui_set_text(
                       cloud_status_label,
-                      "Cloud: checking colassn.github.io...");
+                      "Cloud: synchronizing clock...");
 
-                  esp_err_t error = fetch_cloud_release(&release);
+                  esp_err_t error = ensure_cloud_clock();
                   if (error != ESP_OK) {
                       ui_set_text(
                           cloud_status_label,
-                          "Cloud: manifest unavailable");
+                          "Cloud: clock sync unavailable");
+                  } else {
+                      ui_set_text(
+                          cloud_status_label,
+                          "Cloud: checking colassn.github.io...");
+                      error = fetch_cloud_release(&release);
+                  }
+
+                  if (error != ESP_OK) {
+                      if (cloud_clock_is_valid()) {
+                          ui_set_text(
+                              cloud_status_label,
+                              "Cloud: manifest unavailable");
+                      }
                   } else if (release.build > FIRMWARE_BUILD) {
                       char text[96];
                       snprintf(text, sizeof(text),
@@ -1011,6 +1085,10 @@ jobs:
               lv_lock();
               create_bus_ui();
               lv_unlock();
+
+              // Allow the RGB scan/DMA path to settle before Wi-Fi and HTTPS
+              // begin competing for external-memory bandwidth.
+              vTaskDelay(pdMS_TO_TICKS(800));
 
               start_wifi();
               start_web_server();
@@ -1065,7 +1143,7 @@ jobs:
               ${COMPONENT_LIB}
               PRIVATE
                   FIRMWARE_BUILD=__BUILD_NUMBER__
-                  FIRMWARE_VERSION=\"1.1.__BUILD_NUMBER__\"
+                  FIRMWARE_VERSION=\"1.3.__BUILD_NUMBER__\"
           )
           CMAKE
 
@@ -1101,6 +1179,23 @@ jobs:
 
           CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
           CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+
+          # Stable RGB output while Wi-Fi/cloud networking is active.
+          # Disable PSRAM double-framebuffer mode and use the internal-RAM
+          # bounce buffer to avoid DMA underflow and horizontal line wrapping.
+          # CONFIG_SUNTON_ESP32_DOUBLE_FB is not set
+          # CONFIG_SUNTON_ESP32_DOUBLE_FB_TEARING is not set
+          CONFIG_SUNTON_ESP32_USE_BOUNCE_BUFFER=y
+
+          # Espressif's recommended stability settings for ESP32-S3 RGB LCD
+          # drift under Wi-Fi/flash/PSRAM load.
+          CONFIG_COMPILER_OPTIMIZATION_PERF=y
+          CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+          CONFIG_FREERTOS_HZ=1000
+
+          # Recovery guard: if DMA ever loses RGB frame synchronisation,
+          # restart it at the next VSYNC instead of leaving the picture shifted.
+          CONFIG_LCD_RGB_RESTART_IN_VSYNC=y
 
           CONFIG_LV_FONT_MONTSERRAT_14=y
           CONFIG_LV_FONT_MONTSERRAT_20=y
@@ -1144,7 +1239,7 @@ jobs:
 
           cat > site/version.json <<EOF
           {
-            "version": "1.1.${BUILD_NUMBER}",
+            "version": "1.3.${BUILD_NUMBER}",
             "build": ${BUILD_NUMBER},
             "firmware_url": "${PAGES_BASE_URL}/firmware/ESP32-BUS-DISPLAY-OTA-APP.bin",
             "sha256": "${FIRMWARE_SHA256}",
